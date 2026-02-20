@@ -156,7 +156,7 @@ interface CacheMeta {
 
 interface CachedTableMeta {
   tableId: string                     // references TableMeta.id
-  keyPattern: string                  // e.g. 'users:{id}' or 'users:{id}:{tenantId}'
+  keyPattern: string                  // e.g. 'users:{id}' — placeholders reference PK column apiNames
   columns?: string[]                  // subset cached (apiNames); undefined = all
 }
 ```
@@ -280,11 +280,12 @@ const multiDb = createMultiDb({
     trino: { enabled: true },
   },
 
-  // Optional: executors (keys must match DatabaseMeta.id; only needed for executeMode = 'execute' | 'count')
+  // Optional: executors (only needed for executeMode = 'execute' | 'count')
+  // Keys must match DatabaseMeta.id, except 'trino' which is a special key for the federation layer
   executors: {
     'pg-main': createPostgresExecutor({ connectionString: '...' }),
     'ch-analytics': createClickHouseExecutor({ url: '...' }),
-    'trino': createTrinoExecutor({ url: '...' }),
+    'trino': createTrinoExecutor({ url: '...' }),     // special key — not a DatabaseMeta.id
   },
 
   // Optional: cache providers (keys must match CacheMeta.id)
@@ -416,7 +417,7 @@ interface QueryJoin {
 interface QueryFilter {
   column: string                      // apiName
   operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not_in' | 'like' | 'not_like' | 'is_null' | 'is_not_null'
-  value?: unknown
+  value?: unknown                     // scalar for most operators; array for 'in'/'not_in'; omit for 'is_null'/'is_not_null'
 }
 ```
 
@@ -698,8 +699,9 @@ No external SQL generation packages are used — the query shape is predictable 
 [name-res]    orders.total → public.orders.total_amount
 [name-res]    orders.tenantId → public.orders.tenant_id
 [sql-gen]     Dialect: postgres
-[sql-gen]     SELECT "id", "total_amount" AS "total", ... FROM "public"."orders" WHERE "tenant_id" = $1
+[sql-gen]     SELECT t0."id", t0."total_amount", ... FROM "public"."orders" t0 WHERE t0."tenant_id" = $1
 [execution]   Executing on pg-main → 42 rows, 8ms
+[execution]   Mapping results: total_amount → total (via ColumnMapping)
 ```
 
 For cross-database scenario:
@@ -1053,6 +1055,8 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       │   └── errors.ts        # typed validation errors
 │   │       ├── access/
 │   │       │   └── access.ts        # role-based column trimming
+│   │       ├── masking/
+│   │       │   └── masking.ts       # post-query masking (email, phone, name, etc.)
 │   │       ├── planner/
 │   │       │   ├── planner.ts       # QueryPlanner — strategy selection
 │   │       │   ├── strategies.ts    # direct, materialized, trino, cache
