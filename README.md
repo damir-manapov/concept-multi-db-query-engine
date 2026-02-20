@@ -969,6 +969,11 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 28 | OR filter group | orders WHERE (status='active' OR total > 100) | correct OR clause per dialect |
 | 29 | Negated filter group | orders WHERE NOT (status='cancelled' AND total = 0) | correct NOT (...) per dialect |
 | 30 | ILIKE filter | users WHERE email ILIKE '%@example%' | correct case-insensitive LIKE per dialect |
+| 31 | SQL-only mode | orders (sql-only) | returns SqlResult with sql + params, no execution |
+| 32 | Invalid join (no relation) | orders + metrics | validation error: INVALID_JOIN |
+| 33 | byIds + filters (cache skip) | users byIds=[1,2] + filter status='active' | direct → pg-main (cache skipped) |
+| 34 | Multiple validation errors | from: 'nonexistent', column: 'bad', filter on 'missing' | errors[] contains all issues |
+| 35 | Masking on cached results | users byIds=[1,2] (tenant-user) | cache → redis, email still masked |
 
 ### Sample Column Definitions (orders table)
 
