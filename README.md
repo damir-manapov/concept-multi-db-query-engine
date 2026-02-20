@@ -761,14 +761,17 @@ class ConfigError extends MultiDbError {
 }
 
 class ConnectionError extends MultiDbError {
-  code: 'CONNECTION_FAILED'
+  code: 'CONNECTION_FAILED' | 'NETWORK_ERROR' | 'REQUEST_TIMEOUT'
   details: {
     unreachable: {
       id: string                      // provider id (DatabaseMeta.id or CacheMeta.id)
       type: 'executor' | 'cache'
       engine?: 'postgres' | 'clickhouse' | 'trino' | 'redis'  // which engine failed — helps troubleshooting
       cause?: Error
-    }[]
+    }[]                               // for CONNECTION_FAILED (init-time, multi-provider)
+  } | {
+    url?: string                      // for NETWORK_ERROR / REQUEST_TIMEOUT (HTTP client)
+    timeoutMs?: number                // for REQUEST_TIMEOUT
   }
 }
 
@@ -1366,9 +1369,9 @@ Tests are split between packages. Validation package tests run without DB connec
 | 108 | `levenshteinLte` filter | users WHERE lastName levenshteinLte { text: 'smith', maxDistance: 2 } | PG: `levenshtein(col,$1)<=$2`, CH: `editDistance(col,{p1:String})<={p2:UInt32}`, Trino: `levenshtein_distance(col,?)<= ?` |
 | 110 | `between` filter | orders WHERE total BETWEEN 100 AND 500 | `col BETWEEN $1 AND $2` per dialect |
 | 111 | `contains` filter | users WHERE email contains 'example' | `LIKE '%example%'` (value auto-escaped) |
-| 112 | `icontains` filter | users WHERE email icontains 'EXAMPLE' | dialect-specific case-insensitive `LIKE '%example%'` |
-| 113 | `startsWith` filter | users WHERE email startsWith 'admin' | `LIKE 'admin%'` |
-| 114 | `istartsWith` filter | users WHERE email istartsWith 'ADMIN' | dialect-specific case-insensitive `LIKE 'ADMIN%'` |
+| 112 | `icontains` filter | users WHERE email icontains 'EXAMPLE' | PG: `ILIKE '%EXAMPLE%'`, CH: `ilike(t0.\`email\`, '%EXAMPLE%')`, Trino: `lower(t0."email") LIKE lower('%EXAMPLE%')` |
+| 113 | `startsWith` filter | users WHERE email startsWith 'admin' | PG: `LIKE 'admin%'`, CH: `startsWith(t0.\`email\`, {p1:String})`, Trino: `LIKE 'admin%'` |
+| 114 | `istartsWith` filter | users WHERE email istartsWith 'ADMIN' | PG: `ILIKE 'ADMIN%'`, CH: `ilike(t0.\`email\`, 'ADMIN%')`, Trino: `lower(t0."email") LIKE lower('ADMIN%')` |
 | 115 | Column-vs-column filter | orders WHERE total > discount (QueryColumnFilter) | `t0."total_amount" > t0."discount"` — no params |
 | 124 | Cross-table column filter | orders JOIN products, orders.total > products.price (QueryColumnFilter) | `t0."total_amount" > t1."price"` — cross-table, no params |
 | 125 | `contains` wildcard escaping | users WHERE email contains 'test%user' | `LIKE '%test\%user%'` — `%` in value auto-escaped |
@@ -1378,8 +1381,8 @@ Tests are split between packages. Validation package tests run without DB connec
 | 129 | AVG aggregation | orders AVG(total) as avgTotal | `SELECT AVG(t0."total_amount") as "avgTotal"` |
 | 155 | HAVING with `between` | orders GROUP BY status, HAVING SUM(total) BETWEEN 100 AND 500 | `HAVING SUM(t0."total_amount") BETWEEN $N AND $N+1` — uses `HavingBetween` IR |
 | 156 | byIds + JOIN | orders byIds=[uuid1,uuid2] JOIN products | `SELECT ... FROM orders t0 LEFT JOIN products t1 ON ... WHERE t0."id" = ANY($1)` — cache skipped |
-| 133 | `endsWith` filter | users WHERE email endsWith '@example.com' | `LIKE '%@example.com'` |
-| 134 | `iendsWith` filter | users WHERE email iendsWith '@EXAMPLE.COM' | dialect-specific case-insensitive `LIKE '%@EXAMPLE.COM'` |
+| 133 | `endsWith` filter | users WHERE email endsWith '@example.com' | PG: `LIKE '%@example.com'`, CH: `endsWith(t0.\`email\`, {p1:String})`, Trino: `LIKE '%@example.com'` |
+| 134 | `iendsWith` filter | users WHERE email iendsWith '@EXAMPLE.COM' | PG: `ILIKE '%@EXAMPLE.COM'`, CH: `ilike(t0.\`email\`, '%@EXAMPLE.COM')`, Trino: `lower(t0."email") LIKE lower('%@EXAMPLE.COM')` |
 | 135 | `notBetween` filter | orders WHERE total NOT BETWEEN 0 AND 10 | `NOT (col BETWEEN $1 AND $2)` per dialect |
 | 136 | `notContains` filter | users WHERE email notContains 'spam' | `NOT LIKE '%spam%'` |
 | 137 | `notIcontains` filter | users WHERE email notIcontains 'SPAM' | dialect-specific case-insensitive `NOT LIKE '%SPAM%'` |
@@ -1455,6 +1458,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 216 | Local validation before send | `validateBeforeSend: true`, unknown table | `ValidationError` thrown without network request (no fetch call) |
 | 217 | Health check via HTTP | GET /health → server returns HealthCheckResult | client returns typed `HealthCheckResult` with executor/cache status |
 | 218 | Custom fetch injection | `fetch: mockFetch` in config | client uses injected fetch; verifiable by asserting on mock |
+| 226 | PlannerError deserialization | POST /query → server returns 422 with PlannerError body | client throws `PlannerError` with `code: 'UNREACHABLE_TABLES'`, `instanceof` check passes |
 
 #### `packages/client/tests/contract/` — contract tests (same suite, both implementations)
 
@@ -1778,7 +1782,7 @@ const client = createMultiDbClient({ baseUrl: 'http://localhost:3000' })
 
 const result = await client.query({
   definition: { from: 'orders', columns: ['id', 'total', 'status'] },
-  context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+  context: { roles: { user: ['admin'] } }
 })
 // result is QueryResult<T> — same type as multiDb.query()
 ```
@@ -1838,7 +1842,7 @@ export function describeQueryContract(name: string, factory: () => Promise<Query
     it('simple select', async () => {
       const result = await engine.query({
         definition: { from: 'orders', columns: ['id', 'status'] },
-        context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+        context: { roles: { user: ['admin'] } }
       })
       expect(result.kind).toBe('data')
       expect(result.meta.columns).toHaveLength(2)
@@ -1847,7 +1851,7 @@ export function describeQueryContract(name: string, factory: () => Promise<Query
     it('validation error', async () => {
       await expect(engine.query({
         definition: { from: 'nonexistent' },
-        context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+        context: { roles: { user: ['admin'] } }
       })).rejects.toThrow(ValidationError)
     })
 
@@ -1959,7 +1963,7 @@ This ensures both implementations behave identically — same results, same erro
 │   │   └── tests/
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config for client tests
-│   │       ├── client/              # scenarios 208–218
+│   │       ├── client/              # scenarios 208–218, 226
 │   │       └── contract/            # scenarios 219–225
 │   │
 │   ├── executor-postgres/           # @mkven/multi-db-executor-postgres
