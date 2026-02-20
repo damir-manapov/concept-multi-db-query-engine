@@ -1045,13 +1045,15 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 73 | HAVING with OR group | orders GROUP BY status HAVING (SUM(total) > 1000 OR AVG(total) > 200) | OR in HAVING |
 | 74 | `like` filter | orders WHERE status LIKE 'act%' | correct case-sensitive LIKE per dialect |
 | 75 | `not_like` filter | orders WHERE status NOT LIKE '%cancel%' | correct NOT LIKE per dialect |
-| 76 | Count + groupBy ignored | orders GROUP BY status, SUM(total) (count mode) | groupBy/aggregations ignored, returns scalar count |
+| 76 | Count + groupBy ignored | orders GROUP BY status, SUM(total) (count mode) | groupBy/aggregations/having ignored, returns scalar count |
 | 77 | Order by aggregation alias | orders GROUP BY status, SUM(total) as totalSum, ORDER BY totalSum | correct ORDER BY alias per dialect |
-| 78 | Empty columns array | orders columns: [] | validation error: UNKNOWN_COLUMN |
+| 78 | Empty columns array (no aggregations) | orders columns: [] | validation error: UNKNOWN_COLUMN |
 | 79 | Single Iceberg table query | ordersArchive | direct via trino executor (Trino dialect, single catalog) |
 | 80 | Multiple config errors | invalid apiName + duplicate + broken reference | ConfigError: CONFIG_INVALID, errors[] contains all 3 |
 | 81 | Invalid sync reference | ExternalSync references non-existent table/database | ConfigError: CONFIG_INVALID (INVALID_SYNC) |
 | 82 | Unknown role ID | context roles: { user: ['nonexistent'] } | validation error: UNKNOWN_ROLE |
+| 83 | Aggregation-only query (`columns: []`) | orders columns: [], SUM(total) | correct `SELECT SUM(total) FROM orders` per dialect |
+| 84 | `columns: undefined` + aggregations | orders columns: undefined, GROUP BY status, SUM(total) | default to groupBy columns only (not all allowed) |
 
 ### Test Scenarios by Package
 
@@ -1158,6 +1160,7 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 75 | `not_like` filter | NOT LIKE |
 | 77 | Order by aggregation alias | ORDER BY aggregate alias |
 | 83 | Aggregation-only query (`columns: []`) | `SELECT SUM(total) FROM orders` — no regular columns |
+| 84 | `columns: undefined` + aggregations | default to groupBy columns only (not all allowed) |
 
 #### `tests/cache/` — cache strategy + masking on cached data
 
