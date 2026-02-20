@@ -590,6 +590,7 @@ Given a query touching tables T1, T2, ... Tn:
 - Only for single-table queries **without `joins`** (cache stores single-table data)
 - Only for tables with single-column primary keys (composite PKs use filters instead)
 - Check if the table has a cache config
+- If `CachedTableMeta.columns` is a subset and the query requests columns outside that subset → skip P0 (cache doesn't have the data)
 - If cache hit for all IDs → return from cache (trim columns if needed, apply masking identically to DB results)
 - If partial hit → return cached + fetch missing from DB, merge
 
@@ -627,7 +628,7 @@ Given a query touching tables T1, T2, ... Tn:
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`
 9. **Order By validity** — `orderBy` must reference columns from `from` table or joined tables
-10. **ByIds validity** — `byIds` requires a single-column primary key; cannot combine with `groupBy` or `aggregations`
+10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided
 12. **Exists filter validity** — `QueryExistsFilter.table` must have a defined relation to the `from` table (or a joining table); role must allow access to the related table
 
@@ -890,16 +891,16 @@ For cross-database scenario:
 
 ### Tables
 
-| Table ID | API Name | Database | Physical Name |
-|---|---|---|---|
-| `users` | users | pg-main | public.users |
-| `orders` | orders | pg-main | public.orders |
-| `products` | products | pg-main | public.products |
-| `tenants` | tenants | pg-tenant | public.tenants |
-| `invoices` | invoices | pg-tenant | public.invoices |
-| `events` | events | ch-analytics | default.events |
-| `metrics` | metrics | ch-analytics | default.metrics |
-| `orders-archive` | ordersArchive | iceberg-archive | warehouse.orders_archive |
+| Table ID | API Name | Database | Physical Name | Primary Key |
+|---|---|---|---|---|
+| `users` | users | pg-main | public.users | `id` |
+| `orders` | orders | pg-main | public.orders | `id` |
+| `products` | products | pg-main | public.products | `id` |
+| `tenants` | tenants | pg-tenant | public.tenants | `id` |
+| `invoices` | invoices | pg-tenant | public.invoices | `id` |
+| `events` | events | ch-analytics | default.events | `id` |
+| `metrics` | metrics | ch-analytics | default.metrics | `id` |
+| `orders-archive` | ordersArchive | iceberg-archive | warehouse.orders_archive | `id` |
 
 ### External Syncs (Debezium)
 
@@ -911,10 +912,10 @@ For cross-database scenario:
 
 ### Cache (Redis, synced by Debezium — no TTL)
 
-| Table | Key Pattern |
-|---|---|
-| users | `users:{id}` |
-| products | `products:{id}` |
+| Table | Key Pattern | Columns |
+|---|---|---|
+| users | `users:{id}` | all (undefined) |
+| products | `products:{id}` | all (undefined) |
 
 ### Roles
 
@@ -1002,6 +1003,8 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 61 | Hot-reload metadata | reloadMetadata() with new table added | next query sees new table |
 | 62 | Reload failure | reloadRoles() with failing provider | ProviderError, old config preserved |
 | 63 | Lazy connections | validateConnections: false | init succeeds, healthCheck detects issues |
+| 64 | Multi-table join (3 tables) | orders + products + users (all pg-main) | direct → pg-main, 2 JOINs |
+| 65 | Empty byIds | orders byIds=[] | validation error: INVALID_BY_IDS |
 
 ### Test Scenarios by Package
 
@@ -1031,6 +1034,7 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 34 | Multiple validation errors | multi-error collection |
 | 36 | Invalid limit/offset | rule 11 — INVALID_LIMIT |
 | 37 | byIds + aggregations | rule 10 — INVALID_BY_IDS |
+| 65 | Empty byIds | rule 10 — INVALID_BY_IDS |
 | 40 | Invalid GROUP BY | rule 7 — INVALID_GROUP_BY |
 | 41 | Invalid HAVING | rule 8 — INVALID_HAVING |
 | 42 | Invalid ORDER BY | rule 9 — INVALID_ORDER_BY |
@@ -1072,6 +1076,7 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 56 | No Trino catalog | P4 — NO_CATALOG |
 | 57 | Freshness unmet | P4 — FRESHNESS_UNMET |
 | 59 | Unreachable tables | P4 — UNREACHABLE_TABLES |
+| 64 | Multi-table join (3 tables) | P1 — direct (all pg-main) |
 
 #### `tests/generator/` — SQL generation per dialect
 
@@ -1439,3 +1444,4 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 - [ ] Custom masking functions beyond predefined set?
 - [ ] Nested/grouped results for one-to-many joins? (requires two-query approach: fetch parent IDs with limit, then fetch all children — significant complexity)
 - [ ] OpenTelemetry integration — spans per pipeline phase, traces + metrics
+- [ ] Concurrent reload safety — if `reloadMetadata()` runs while a query is in-flight, which config does the query see? Options: snapshot isolation (query uses config captured at start), or queue reloads behind in-flight queries
