@@ -111,10 +111,12 @@ interface TableMeta {
 ### Columns
 
 ```ts
+type ColumnType = 'string' | 'int' | 'decimal' | 'boolean' | 'uuid' | 'date' | 'timestamp'
+
 interface ColumnMeta {
   apiName: string                     // 'customerEmail'
   physicalName: string                // 'customer_email'
-  type: string                        // logical type: 'string', 'int', 'date', 'uuid', 'decimal', 'timestamp', etc.
+  type: ColumnType                    // logical type used for filter operator validation and aggregation type inference
   nullable: boolean
   maskingFn?: 'email' | 'phone' | 'name' | 'uuid' | 'number' | 'date' | 'full'
                                       // how to mask this column when masking is applied by role
@@ -626,7 +628,7 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type; filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
@@ -638,6 +640,22 @@ Given a query touching tables T1, T2, ... Tn:
 14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected
 
 All validation errors are **collected, not thrown one at a time**. The system runs all applicable checks and throws a single `ValidationError` containing every issue found. This lets callers fix all problems at once instead of playing whack-a-mole.
+
+### Filter Operator / Column Type Compatibility
+
+| Operator | string | int | decimal | boolean | uuid | date | timestamp |
+|---|---|---|---|---|---|---|---|
+| `=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `!=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `>` `<` `>=` `<=` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
+| `in` `not_in` | ✓ | ✓ | ✓ | — | ✓ | — | — |
+| `like` `not_like` | ✓ | — | — | — | — | — | — |
+| `ilike` `not_ilike` | ✓ | — | — | — | — | — | — |
+| `is_null` `is_not_null` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
+
+\* `is_null` / `is_not_null` are valid on any type but only on columns with `nullable: true`.
+
+Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`not_in` are rejected on `date`/`timestamp` — use range comparisons instead. `like`/`ilike` are string-only.
 
 ---
 
@@ -947,7 +965,7 @@ For cross-database scenario:
 | Table | Key Pattern | Columns |
 |---|---|---|
 | users | `users:{id}` | all (undefined) |
-| products | `products:{id}` | all (undefined) |
+| products | `products:{id}` | `id`, `name`, `category` (subset — price excluded) |
 
 ### Roles
 
@@ -1053,7 +1071,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 59 | Unreachable tables | metrics + tenants (no replica, no trino catalog) | PlannerError: UNREACHABLE_TABLES |
 | 64 | Multi-table join (3 tables) | orders + products + users (all pg-main) | direct → pg-main, 2 JOINs |
 | 79 | Single Iceberg table query | ordersArchive | direct via trino executor (Trino dialect, single catalog) |
-| 103 | Cache column subset → P0 skip | users byIds=[1,2], query columns include 'createdAt' but cache only has subset | skip cache → direct DB |
+| 103 | Cache column subset → P0 skip | products byIds=[1,2], columns: [id, name, price] but cache only has [id, name, category] | skip cache → direct DB |
 
 #### `packages/core/tests/generator/` — SQL generation per dialect
 
@@ -1361,6 +1379,8 @@ const queryErrors = validateQuery(definition, context, metadata, roles)  // retu
 
 Both `validateConfig()` and `validateQuery()` return `null` on success, or the corresponding error object (not thrown) so the caller can decide how to handle it. The core package still throws these errors internally.
 
+`validateQuery()` builds lightweight internal indexes (table-by-apiName, column-by-apiName maps) on each call. For hot paths, callers can pre-index metadata once and pass the indexed form — the function accepts both raw `MetadataConfig` and a pre-indexed `MetadataIndex` (exported from the package) to avoid repeated indexing.
+
 Core has **zero I/O dependencies** — usable for SQL-only mode without any DB drivers. Each executor is a thin adapter that consumers install only if needed.
 
 ---
@@ -1382,7 +1402,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │   ├── tsconfig.json
 │   │   ├── src/
 │   │   │   ├── index.ts             # public API: validateQuery, validateConfig, validateApiName + re-exports
-│   │   │   ├── errors.ts            # MultiDbError hierarchy (ConfigError, ValidationError, etc.)
+│   │   │   ├── errors.ts            # MultiDbError, ConfigError, ConnectionError, ValidationError, PlannerError, ExecutionError, ProviderError
 │   │   │   ├── types/
 │   │   │   │   ├── metadata.ts      # DatabaseMeta, TableMeta, ColumnMeta, RelationMeta, ExternalSync, CacheMeta, RoleMeta
 │   │   │   │   ├── query.ts         # QueryDefinition, QueryFilter, QueryJoin, QueryAggregation, etc.
