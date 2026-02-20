@@ -474,7 +474,7 @@ interface QueryGroupBy {
 interface QueryJoin {
   table: string                       // related table apiName
   type?: 'inner' | 'left'            // default: 'left' (safe for nullable FKs)
-  columns?: string[]                  // columns to select from joined table
+  columns?: string[]                  // columns to select from joined table; undefined = all allowed for role; [] = no columns (join used for filter/groupBy only)
   filters?: (QueryFilter | QueryFilterGroup | QueryExistsFilter)[]  // filters on joined table
 }
 
@@ -847,7 +847,7 @@ interface JoinClause {
 }
 
 interface WhereCondition {
-  column: ColumnRef
+  column: ColumnRef | string          // ColumnRef for table columns; bare string for aggregation aliases in HAVING (e.g. 'totalSum')
   operator: string                    // '=', 'ILIKE', 'ANY', etc. — string (not union) because dialects may emit operators beyond the public QueryFilter set
   paramIndex?: number                 // for parameterized values (mutually exclusive with `literal`)
   literal?: string                    // for IS NULL, IS NOT NULL (mutually exclusive with `paramIndex`)
