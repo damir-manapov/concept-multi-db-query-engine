@@ -632,7 +632,7 @@ Given a query touching tables T1, T2, ... Tn:
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
 9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`
-11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided
+11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided; `offset` requires `limit` (offset without limit is rejected)
 12. **Exists filter validity** — `QueryExistsFilter.table` must have a defined relation to the `from` table (or a joining table); role must allow access to the related table
 13. **Role existence** — all role IDs in `ExecutionContext.roles` must exist in loaded roles; unknown IDs are rejected with `UNKNOWN_ROLE`
 14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected
@@ -978,6 +978,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 80 | Multiple config errors | invalid apiName + duplicate + broken reference | ConfigError: CONFIG_INVALID, errors[] contains all 3 |
 | 81 | Invalid sync reference | ExternalSync references non-existent table/database | ConfigError: CONFIG_INVALID (INVALID_SYNC) |
 | 89 | Invalid cache config | CacheMeta references non-existent table or invalid keyPattern placeholder | ConfigError: CONFIG_INVALID (INVALID_CACHE) |
+| 96 | Duplicate column apiName | two columns in same table with apiName 'status' | ConfigError: CONFIG_INVALID (DUPLICATE_API_NAME) |
 
 #### `packages/validation/tests/query/` — query validation against metadata + roles (ValidationError)
 
@@ -990,18 +991,20 @@ Tests are split between packages. Validation package tests run without DB connec
 | 34 | Multiple validation errors | from: 'nonexistent', column: 'bad', filter on 'missing' | multi-error collection |
 | 36 | Invalid limit/offset | orders limit: -1 | rule 11 — INVALID_LIMIT |
 | 37 | byIds + aggregations | users byIds + GROUP BY | rule 10 — INVALID_BY_IDS |
-| 65 | Empty byIds | orders byIds=[] | rule 10 — INVALID_BY_IDS |
 | 40 | Invalid GROUP BY | orders columns: [status, total], groupBy: [status] | rule 7 — INVALID_GROUP_BY |
 | 41 | Invalid HAVING | orders having on non-existent alias | rule 8 — INVALID_HAVING |
 | 42 | Invalid ORDER BY | orders orderBy: products.category (not joined) | rule 9 — INVALID_ORDER_BY |
 | 43 | Invalid EXISTS filter | orders EXISTS metrics (no relation) | rule 12 — INVALID_EXISTS |
 | 46 | Invalid filter operator | orders WHERE id > 'some-uuid' (uuid type) | rule 5 — INVALID_FILTER |
 | 47 | Access denied on column | orders columns: [internalNote] (tenant-user) | rule 4 — ACCESS_DENIED (column) |
+| 65 | Empty byIds | orders byIds=[] | rule 10 — INVALID_BY_IDS |
 | 78 | Empty columns array (no aggregations) | orders columns: [] | rule 14 — INVALID_AGGREGATION |
 | 82 | Unknown role ID | context roles: { user: ['nonexistent'] } | rule 13 — UNKNOWN_ROLE |
 | 86 | EXISTS inside HAVING | orders HAVING group with EXISTS invoices | rule 8 — INVALID_HAVING (EXISTS not valid in HAVING) |
 | 87 | Duplicate aggregation alias | orders SUM(total) as x, COUNT(*) as x | rule 14 — INVALID_AGGREGATION |
 | 88 | Alias collides with column apiName | orders columns: [status], SUM(total) as status | rule 14 — INVALID_AGGREGATION |
+| 97 | Offset without limit | orders offset: 10 (no limit) | rule 11 — INVALID_LIMIT |
+| 98 | Filter on joined non-existent column | orders JOIN products, filter: products.nonexistent = 'x' | rule 2 — UNKNOWN_COLUMN |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1024,6 +1027,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 14f | Omitted scope | orders (only user: ['admin'], no service) | no service restriction |
 | 16 | Column trimming on byIds | users byIds + limited columns in role | only intersected columns |
 | 38 | Columns omitted | orders (no columns specified, tenant-user) | returns only role-allowed columns |
+| 95 | Empty scope intersection | events (analytics-reader user + orders-service) | service scope excludes events → ACCESS_DENIED |
 
 #### `packages/core/tests/planner/` — strategy selection (P0–P4)
 
@@ -1079,6 +1083,11 @@ Tests are split between packages. Validation package tests run without DB connec
 | 83 | Aggregation-only query (`columns: []`) | orders columns: [], SUM(total) | `SELECT SUM(total) FROM orders` |
 | 84 | `columns: undefined` + aggregations | orders columns: undefined, GROUP BY status, SUM(total) | groupBy columns only (not all) |
 | 85 | Join with `columns: []` | orders JOIN products (columns: []), GROUP BY products.category | join for groupBy only, no product columns in SELECT |
+| 90 | Basic happy-path | orders WHERE tenantId = 'abc' | simple SELECT + WHERE, no joins/aggregations |
+| 91 | LEFT JOIN | orders LEFT JOIN products | LEFT JOIN clause, null-safe behavior |
+| 92 | Trino cross-catalog SQL | orders (pg-main) + events (ch-analytics) via Trino | `pg_main.public.orders` cross-catalog references |
+| 93 | COUNT(*) aggregation | orders COUNT(*) as totalOrders | `SELECT COUNT(*) as "totalOrders" FROM ...` |
+| 94 | Dialect: parameter binding | orders WHERE status = 'active' | PG: `$1`, CH: `{p1:String}`, Trino: `?` |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1379,8 +1388,8 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │   └── tests/
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
-│   │       ├── config/              # scenarios 49–52, 80, 81, 89
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88
+│   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1414,9 +1423,9 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (reuses validation fixtures + adds executors)
 │   │       ├── init/                # scenarios 53, 54, 55, 63
-│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38
+│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94
 │   │       ├── cache/               # scenario 35
 │   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76
 │   │
