@@ -485,6 +485,7 @@ interface QueryFilter {
 
 interface QueryFilterGroup {
   logic: 'and' | 'or'
+  not?: boolean                       // default: false — when true, negates the entire group: NOT (c1 AND/OR c2 ...)
   conditions: (QueryFilter | QueryFilterGroup | QueryExistsFilter)[]  // recursive — supports arbitrary nesting
 }
 
@@ -782,6 +783,7 @@ type WhereNode = WhereCondition | WhereGroup | WhereExists
 
 interface WhereGroup {
   logic: 'and' | 'or'
+  not?: boolean                       // when true, emits NOT (...)
   conditions: WhereNode[]
 }
 
@@ -964,6 +966,7 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 26 | NOT EXISTS filter | users WHERE NOT EXISTS orders | correct NOT EXISTS subquery per dialect |
 | 27 | Nested EXISTS + filter group | orders WHERE (status='active' OR EXISTS invoices) | EXISTS inside OR group |
 | 28 | OR filter group | orders WHERE (status='active' OR total > 100) | correct OR clause per dialect |
+| 29 | Negated filter group | orders WHERE NOT (status='cancelled' AND total = 0) | correct NOT (...) per dialect |
 
 ### Sample Column Definitions (orders table)
 
@@ -1178,7 +1181,7 @@ const roles: RoleMeta[] = [
 | Debug logging | Structured entries per pipeline phase, opt-in via `debug: true` | Zero overhead when not debugging |
 | Validation | Strict — only metadata-defined entities | Fail fast with clear errors |
 | Join results | Flat denormalized rows (no nesting) | `limit` applies to DB rows; with one-to-many joins, `limit: 10` may yield fewer than 10 parent entities. Nesting would require a two-query approach (fetch parent IDs first, then children), breaking the single-query model. Callers can group results using `meta.columns[].fromTable` |
-| Filter logic | Recursive `QueryFilterGroup` with `and`/`or` | Top-level filters array is implicit AND; use `QueryFilterGroup` for OR or nested combinations. Mirrors to `WhereGroup` in `SqlParts` IR. Simple queries stay simple, complex logic is opt-in |
+| Filter logic | Recursive `QueryFilterGroup` with `and`/`or` and optional `not` | Top-level filters array is implicit AND; use `QueryFilterGroup` for OR, nested combinations, or negation (`not: true` → `NOT (...)`). Mirrors to `WhereGroup` in `SqlParts` IR. Simple queries stay simple, complex logic is opt-in |
 | Exists filters | `QueryExistsFilter` with correlated subquery | Leverages existing relation metadata for `EXISTS`/`NOT EXISTS`. No implicit JOIN — keeps result set clean. Access control applied to the related table. Mirrors to `WhereExists` in `SqlParts` IR |
 | Imports | Absolute paths, no `../` | Clean, refactor-friendly |
 
