@@ -359,7 +359,7 @@ At init time:
   - `Map<tableId, ExternalSync[]>` — syncs per table
   - `Map<tableId, CachedTableMeta>` — cache config per table
 - Database connectivity graph is built (for planner)
-- All executors and cache providers are **pinged** to verify connectivity (calls `ping()` on each). If any fail, a `ConfigError` with code `CONNECTION_FAILED` is thrown. Disable with `validateConnections: false` for lazy connection scenarios
+- All executors and cache providers are **pinged** to verify connectivity (calls `ping()` on each). If any fail, a `ConnectionError` is thrown listing all unreachable providers. Disable with `validateConnections: false` for lazy connection scenarios
 - Configuration errors are thrown immediately
 
 ### Query Request (per call)
@@ -622,8 +622,13 @@ class MultiDbError extends Error {
 }
 
 class ConfigError extends MultiDbError {
-  code: 'INVALID_API_NAME' | 'DUPLICATE_API_NAME' | 'INVALID_REFERENCE' | 'INVALID_RELATION' | 'CONNECTION_FAILED'
-  details: { entity?: string; field?: string; expected?: string; actual?: string; unreachable?: string[] }
+  code: 'INVALID_API_NAME' | 'DUPLICATE_API_NAME' | 'INVALID_REFERENCE' | 'INVALID_RELATION'
+  details: { entity?: string; field?: string; expected?: string; actual?: string }
+}
+
+class ConnectionError extends MultiDbError {
+  code: 'CONNECTION_FAILED'
+  details: { unreachable: { id: string; type: 'executor' | 'cache'; error?: string }[] }
 }
 
 class ValidationError extends MultiDbError {
@@ -651,7 +656,7 @@ class ProviderError extends MultiDbError {
 }
 ```
 
-`ConfigError` is thrown at init time (invalid apiNames, duplicate names, broken DB/table/relation references). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. `PlannerError` is thrown when no execution strategy can satisfy the query. `ExecutionError` is thrown during SQL execution or cache access — for `QUERY_FAILED`, the `sql` and `params` that caused the failure are included for debugging. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails (wraps the original error).
+`ConfigError` is thrown at init time (invalid apiNames, duplicate names, broken DB/table/relation references). `ConnectionError` is thrown at init time when executor/cache pings fail — conceptually distinct from config validation (config is correct, infrastructure is unreachable). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. `PlannerError` is thrown when no execution strategy can satisfy the query. `ExecutionError` is thrown during SQL execution or cache access — for `QUERY_FAILED`, the `sql` and `params` that caused the failure are included for debugging. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails (wraps the original error).
 
 ---
 
