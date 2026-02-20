@@ -143,7 +143,7 @@ interface ExternalSync {
   targetDatabase: string              // DatabaseMeta.id where materialized
   targetPhysicalName: string          // physical name in target DB
   method: 'debezium'
-  estimatedLag: 'realtime' | 'seconds' | 'minutes' | 'hours'
+  estimatedLag: 'seconds' | 'minutes' | 'hours'
 }
 ```
 
@@ -557,7 +557,7 @@ interface QueryResultMeta {
   }[]
   columns: {
     apiName: string                  // for aggregations: the alias (e.g. 'totalSum')
-    type: string                     // for aggregations: inferred from fn (count → 'int', sum/avg/min/max → source column type)
+    type: ColumnType                  // for aggregations: inferred from fn (count → 'int', sum/avg/min/max → source column type)
     nullable: boolean
     fromTable: string                // table apiName; for aggregations: the source column's table (or `from` table for count(*))
     masked: boolean                  // whether this column was masked (always false for aggregation aliases)
@@ -606,8 +606,8 @@ Given a query touching tables T1, T2, ... Tn:
 
 ### Priority 2 — Materialized Replica
 - Some tables are in different databases, BUT debezium replicas exist such that all needed data is available in one database
-- Check freshness: if query requires `realtime` but replica lag is `minutes` → skip this strategy
-- Freshness hierarchy (strictest to most relaxed): `realtime` < `seconds` < `minutes` < `hours`. A replica is acceptable when its `estimatedLag` ≤ the query's `freshness` tolerance
+- Check freshness: if query requires `realtime` → skip this strategy entirely (replicas always have lag); if `freshness` = `seconds` but replica lag is `minutes` → also skip
+- Freshness hierarchy (strictest to most relaxed): `realtime` < `seconds` < `minutes` < `hours`. `realtime` is query-only (never an `estimatedLag` value) — it means direct access required. A replica is acceptable when its `estimatedLag` ≤ the query's `freshness` tolerance
 - Always prefer the **original** database if the original data is there; use replicas for the "foreign" tables
 - If multiple databases could serve via replicas, prefer the one with the most original tables
 
@@ -628,7 +628,7 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type (see table below); filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
@@ -788,7 +788,7 @@ interface ColumnMapping {
   apiName: string                     // 'total'; for aggregations: the alias (e.g. 'totalSum')
   tableAlias: string                  // 't0'; for aggregations: the source column's table alias (or from-table alias for count(*))
   masked: boolean                     // apply masking after fetch (always false for aggregation aliases)
-  type: string                        // logical column type; for aggregations: inferred from fn (count → 'int', sum/avg/min/max → source column type)
+  type: ColumnType                    // logical column type; for aggregations: inferred from fn (count → 'int', sum/avg/min/max → source column type)
   maskingFn?: 'email' | 'phone' | 'name' | 'uuid' | 'number' | 'date' | 'full'
                                       // which masking function to apply (from ColumnMeta)
 }
@@ -901,8 +901,9 @@ No external SQL generation packages are used — the query shape is predictable 
 [validation]  Resolving table 'orders' → found in metadata (database: pg-main)
 [validation]  Column 'id' → valid (type: uuid)
 [validation]  Column 'total' → valid (type: decimal)
-[validation]  Column 'internalNote' → DENIED for role 'tenant-user' (not in allowedColumns)
-[access-control] Trimming columns to allowed set: [id, total, status, createdAt]
+[validation]  Columns not explicitly listed — deferring full set to access control
+[access-control] Role 'tenant-user': allowed columns [id, total, status, createdAt]
+[access-control] Trimming result set to allowed columns
 [access-control] Masking column 'total' for roles [tenant-user]
 [planning]    Tables needed: [orders(pg-main)]
 [planning]    All tables in 'pg-main' → strategy: DIRECT
@@ -1023,6 +1024,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 88 | Alias collides with column apiName | orders columns: [status], SUM(total) as status | rule 14 — INVALID_AGGREGATION |
 | 97 | Offset without limit | orders offset: 10 (no limit) | rule 11 — INVALID_LIMIT |
 | 98 | Filter on joined non-existent column | orders JOIN products, filter: products.nonexistent = 'x' | rule 2 — UNKNOWN_COLUMN |
+| 107 | `is_null` on non-nullable | orders WHERE id IS NULL (id: nullable=false) | rule 5 — INVALID_FILTER |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1047,6 +1049,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 38 | Columns omitted | orders (no columns specified, tenant-user) | returns only role-allowed columns |
 | 95 | Empty scope intersection | events (analytics-reader user + orders-service) | service scope excludes events → ACCESS_DENIED |
 | 104 | Empty roles array | orders (user: []) | zero roles → zero permissions → ACCESS_DENIED |
+| 106 | Cross-scope masking | orders (user: [regional-manager], service: [svc-role w/ maskedColumns: ['total']]) | user scope unmasks total, service scope masks it → stays masked (scope intersection) |
 
 #### `packages/core/tests/planner/` — strategy selection (P0–P4)
 
@@ -1381,6 +1384,15 @@ Both `validateConfig()` and `validateQuery()` return `null` on success, or the c
 
 `validateQuery()` builds lightweight internal indexes (table-by-apiName, column-by-apiName maps) on each call. For hot paths, callers can pre-index metadata once and pass the indexed form — the function accepts both raw `MetadataConfig` and a pre-indexed `MetadataIndex` (exported from the package) to avoid repeated indexing.
 
+```ts
+// Pre-indexed metadata for hot-path validation
+interface MetadataIndex {
+  tablesByApiName: Map<string, TableMeta>
+  columnsByTable: Map<string, Map<string, ColumnMeta>>  // tableApiName → columnApiName → ColumnMeta
+  rolesByName: Map<string, RoleMeta>
+}
+```
+
 Core has **zero I/O dependencies** — usable for SQL-only mode without any DB drivers. Each executor is a thin adapter that consumers install only if needed.
 
 ---
@@ -1416,7 +1428,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1450,7 +1462,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (reuses validation fixtures + adds executors)
 │   │       ├── init/                # scenarios 53, 54, 55, 63
-│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104
+│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103
 │   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102
 │   │       ├── cache/               # scenario 35
