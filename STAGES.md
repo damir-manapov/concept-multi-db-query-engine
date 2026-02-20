@@ -13,7 +13,7 @@ This document breaks the concept into sequential implementation stages. Each sta
 **Tasks:**
 1. Init pnpm workspace, root `package.json`, `pnpm-workspace.yaml`
 2. Root configs: `tsconfig.json`, `biome.json`, `vitest.config.ts`
-3. Create package directories for all 8 packages (validation, core, 3 executors, cache-redis, client)
+3. Create package directories for all 7 packages (validation, core, 3 executors, cache-redis, client)
 4. Per-package `package.json` + `tsconfig.json` with correct `references`
 5. Define all types in `packages/validation/src/types/`:
    - `metadata.ts` — `DatabaseEngine`, `DatabaseMeta`, `TableMeta`, `ColumnMeta`, `ScalarColumnType`, `ArrayColumnType`, `ColumnType`, `RelationMeta`, `ExternalSync`, `CacheMeta`, `CachedTableMeta`, `MetadataConfig`, `RoleMeta`, `TableRoleAccess`
@@ -51,7 +51,7 @@ This document breaks the concept into sequential implementation stages. Each sta
 
 **Exit criteria:** All error classes instantiable, `toJSON()` produces correct plain objects, `JSON.stringify()` safe.
 
-**Test scenarios covered:** #132 (toJSON serialization)
+**Test scenarios covered:** — (error classes verified by ad hoc unit tests; numbered scenario #132 is the integration test in Stage 12)
 
 ---
 
@@ -130,7 +130,7 @@ This document breaks the concept into sequential implementation stages. Each sta
 
 **Exit criteria:** Registry loads, indexes, and reloads. Failed reloads preserve previous config. Snapshot isolation for concurrent queries.
 
-**Test scenarios covered:** #54, #55, #61, #62, #171, #228
+**Test scenarios covered:** #54, #55, #62
 
 ---
 
@@ -196,7 +196,8 @@ This document breaks the concept into sequential implementation stages. Each sta
    - Parameter binding: `$1, $2, ...`
    - `in` → `= ANY($1::type[])` with type casts (`text[]`, `integer[]`, `numeric[]`, `uuid[]`)
    - `notIn` → `<> ALL($1::type[])`
-   - `ILIKE` (native)
+   - `like`/`notLike` → `LIKE` / `NOT LIKE` (user-provided pattern)
+   - `ilike`/`notIlike` → `ILIKE` / `NOT ILIKE` (native)
    - `startsWith`/`endsWith` → `LIKE 'x%'` / `LIKE '%x'`
    - `istartsWith`/`iendsWith` → `ILIKE 'x%'` / `ILIKE '%x'`
    - `levenshtein(col, $1) <= $2` (requires `fuzzystrmatch`)
@@ -212,12 +213,11 @@ This document breaks the concept into sequential implementation stages. Each sta
    - `WhereColumnCondition` → `t0."col1" > t1."col2"`
    - Aggregation: `COUNT(*)`, `SUM(...)`, `AVG(...)`, `MIN(...)`, `MAX(...)`
    - `INNER JOIN` / `LEFT JOIN` with `ON` condition
-   - Trino catalog prefix for Iceberg tables queried via Trino
 3. Wildcard escaping for `%` and `_` in pattern values
 
 **Exit criteria:** All SQL generation tests pass for Postgres dialect.
 
-**Test scenarios covered (Postgres output):** #20–30, #45, #66–77, #83–85, #90–94, #99–102, #108, #110–115, #124–129, #133–138, #142, #144, #147–149, #155–157, #160–164, #166, #181–186, #188–189, #193, #194, #196, #197, #200–207, #227
+**Test scenarios covered (Postgres output):** #20–30, #45, #66–75, #77, #83–85, #90–94, #99–102, #108, #110–115, #124–129, #133–138, #142, #144, #147–149, #155–157, #160–164, #166, #181–186, #188–189, #193, #194, #196, #197, #200–207, #227
 
 ---
 
@@ -347,7 +347,7 @@ This document breaks the concept into sequential implementation stages. Each sta
 
 **Exit criteria:** Full query pipeline works end-to-end. Init, reload, health, and close lifecycle complete.
 
-**Test scenarios covered:** #14e, #31, #35, #39, #44, #48, #53, #58, #60, #63, #76, #105, #131, #132, #152, #170, #172, #228
+**Test scenarios covered:** #14e, #31, #35, #39, #44, #48, #53, #58, #60, #61, #63, #76, #105, #131, #132, #152, #170, #171, #172, #228
 
 ---
 
@@ -376,27 +376,20 @@ This document breaks the concept into sequential implementation stages. Each sta
 
 ---
 
-## Stage 14 — Integration & Edge Cases
+## Stage 14 — Final Verification
 
-**Goal:** Complete remaining e2e scenarios and harden edge cases.
+**Goal:** Run all 235 test scenarios together, verify cross-stage integration, and confirm no regressions.
 
-**Package:** `@mkven/multi-db`
+**Package:** all
 
 **Tasks:**
-1. `byIds` + cache → full hit, partial hit (cache + DB merge), miss
-2. `byIds` + count mode → `SELECT COUNT(*) WHERE pk = ANY($1)`
-3. `byIds` + JOIN → cache skipped, DB handles it
-4. Partial `close()` failure — all providers attempted, aggregate error
-5. Reload during in-flight query — snapshot isolation verified
-6. Reload with invalid config — `ConfigError`, old config preserved
-7. Executor timeout enforcement — driver-level timeout, `QUERY_TIMEOUT`
-8. Count mode ignores groupBy/aggregations/having
-9. Null handling in aggregations — `SUM`/`AVG`/`MIN`/`MAX` return NULL when all values NULL
-10. `DISTINCT` + `GROUP BY` — valid but redundant
+1. Run full test suite across all packages — `pnpm test` at monorepo root
+2. Verify scenario counts: validation (77), core (138), client (19), contract (7) — numbers may overlap where a scenario is tested in multiple packages (e.g. #157 is validated in both validation/query and core/generator)
+3. Smoke-test the full pipeline end-to-end: init → query → reload → healthCheck → close
+4. Verify `pnpm build` produces clean packages with correct dependency graph
+5. Review test coverage gaps — any untested code paths surfaced by coverage reports
 
-**Exit criteria:** All 235 test scenarios pass.
-
-**Test scenarios covered:** remaining e2e scenarios — #8–10, #33, #130, #156, #164, #170–172
+**Exit criteria:** All 235 test scenarios pass across all packages. Build succeeds. No regressions.
 
 ---
 
@@ -405,19 +398,19 @@ This document breaks the concept into sequential implementation stages. Each sta
 | Stage | Package | Focus | Scenarios |
 |---|---|---|---|
 | 1 | all | Scaffold + types | — |
-| 2 | validation | Error classes | 1 |
+| 2 | validation | Error classes | — |
 | 3 | validation | Config validation | 8 |
-| 4 | validation | Query validation (14 rules) | 64 |
-| 5 | core | Metadata registry + providers | 6 |
+| 4 | validation | Query validation (14 rules) | 69 |
+| 5 | core | Metadata registry + providers | 3 |
 | 6 | core | Access control + masking | 12 |
 | 7 | core | Name resolution | — |
-| 8 | core | SQL gen — Postgres | 86 |
-| 9 | core | SQL gen — ClickHouse + Trino | — (same 86, 2 more dialects) |
+| 8 | core | SQL gen — Postgres | 89 |
+| 9 | core | SQL gen — ClickHouse + Trino | — (same 89, 2 more dialects) |
 | 10 | core | Query planner (P0–P4) | 20 |
 | 11 | executor-*, cache-redis | DB executors + Redis cache | — |
-| 12 | core | Full pipeline + lifecycle | 18 |
-| 13 | client | HTTP client + contract tests | 20 |
-| 14 | core | Integration + edge cases | varies |
+| 12 | core | Full pipeline + lifecycle | 21 |
+| 13 | client | HTTP client + contract tests | 19 |
+| 14 | all | Final verification | — |
 | **Total** | | | **235** |
 
 **Dependency graph:**
@@ -431,12 +424,13 @@ Stage 1 (scaffold)
                           ├─► Stage 6 (access control)
                           │     └─► Stage 7 (name resolution)
                           │           └─► Stage 8 (SQL gen: Postgres)
-                          │                 └─► Stage 9 (SQL gen: CH + Trino)
-                          │                       └─► Stage 10 (planner)
-                          │                             └─► Stage 12 (pipeline)
-                          │                                   └─► Stage 14 (integration)
-                          └─► Stage 11 (executors) ──────────────┘
-                                                         └─► Stage 13 (HTTP client)
+                          │                 └─► Stage 9 (SQL gen: CH + Trino) ─┐
+                          ├─► Stage 10 (planner) ──────────────────────────────┤
+                          └─► Stage 11 (executors) ────────────────────────────┤
+                                                                               ▼
+                                                                   Stage 12 (pipeline)
+                                                                     ├─► Stage 13 (HTTP client)
+                                                                     └─► Stage 14 (final verification)
 ```
 
-Stages 8–9 and 11 can be parallelized across developers — SQL generation is independent of executor packages.
+Three branches run in parallel from Stage 5: the SQL generation chain (6→7→8→9), the planner (10), and the executor packages (11). Stage 12 requires all three. This means up to three developers can work simultaneously after Stage 5 is complete.
