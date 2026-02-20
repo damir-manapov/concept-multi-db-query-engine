@@ -123,6 +123,8 @@ interface ColumnMeta {
 
 ### Relations
 
+Relations are defined on the table that holds the FK column. When resolving joins, the system performs **bidirectional lookup** — if a query says `from: 'orders', joins: [{ table: 'invoices' }]`, both `ordersRelations` and `invoicesRelations` are checked to find a connection.
+
 ```ts
 interface RelationMeta {
   column: string                      // apiName of FK column in this table
@@ -233,6 +235,24 @@ interface MultiDb {
 }
 ```
 
+### Executor & Cache Provider Interfaces
+
+Each executor and cache provider must implement a minimal interface:
+
+```ts
+// Implemented by each executor package (postgres, clickhouse, trino)
+interface DbExecutor {
+  execute(sql: string, params: unknown[]): Promise<Record<string, unknown>[]>
+  close(): Promise<void>
+}
+
+// Implemented by each cache provider package (redis)
+interface CacheProvider {
+  getMany(keys: string[]): Promise<Map<string, Record<string, unknown> | null>>
+  close(): Promise<void>
+}
+```
+
 ---
 
 ## Module Initialization & Query API
@@ -245,6 +265,7 @@ The module is initialized with the full metadata configuration and optional exec
 import { createMultiDb } from '@mkven/multi-db'
 import { createPostgresExecutor } from '@mkven/multi-db-executor-postgres'
 import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
+import { createTrinoExecutor } from '@mkven/multi-db-executor-trino'
 import { createRedisCache } from '@mkven/multi-db-cache-redis'
 
 // Returns MultiDb instance
@@ -259,10 +280,11 @@ const multiDb = createMultiDb({
     trino: { enabled: true },
   },
 
-  // Optional: executors (only needed for executeMode = 'execute' | 'count')
+  // Optional: executors (keys must match DatabaseMeta.id; only needed for executeMode = 'execute' | 'count')
   executors: {
     'pg-main': createPostgresExecutor({ connectionString: '...' }),
     'ch-analytics': createClickHouseExecutor({ url: '...' }),
+    'trino': createTrinoExecutor({ url: '...' }),
   },
 
   // Optional: cache providers (keys must match CacheMeta.id)

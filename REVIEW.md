@@ -181,3 +181,31 @@ No way to express `SELECT DISTINCT`.
 `executors` map uses `DatabaseMeta.id` as keys. `cacheProviders` keys were not documented as matching `CacheMeta.id`.
 
 **Resolution:** Updated init comment to state "keys must match `CacheMeta.id`".
+
+---
+
+## Round 4
+
+### 27. `executors` key mapping undocumented
+
+`cacheProviders` says "keys must match `CacheMeta.id`", but `executors` had no similar comment.
+
+**Resolution:** Updated init comment to "keys must match `DatabaseMeta.id`".
+
+### 28. Trino executor missing from init example
+
+Config has `trino: { enabled: true }`, but init only imported postgres + clickhouse executors. P3 strategy can't execute without it.
+
+**Resolution:** Added `createTrinoExecutor` import and `'trino'` entry in executors map.
+
+### 29. Executor & CacheProvider interfaces not defined
+
+5 packages with 4 adapters, but no documented interface for what an executor or cache provider must implement.
+
+**Resolution:** Added `DbExecutor` interface (`execute`, `close`) and `CacheProvider` interface (`getMany`, `close`).
+
+### 30. Relation lookup direction undocumented
+
+Relations are defined on the FK table. If user queries `from: 'orders', joins: [{ table: 'invoices' }]`, the system needs to check relations bidirectionally.
+
+**Resolution:** Added documentation that relation lookup is bidirectional — both tables' relations are checked to find a connection.
