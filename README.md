@@ -15,7 +15,7 @@ Build a reusable, metadata-driven query engine that lets applications query, fil
 - Provides **structured debug logs** for transparent pipeline tracing
 - Supports **hot-reload** of metadata and roles, **health checks** for all providers, and graceful **shutdown**
 
-The monorepo ships a standalone **validation package** (`@mkven/multi-db-validation`) with **zero I/O dependencies** — clients can validate configs and queries locally before sending to the server. The core package (`@mkven/multi-db`) depends on it and adds planning, SQL generation, and masking, also with zero I/O deps. Database drivers and cache clients live in separate executor/cache packages.
+The monorepo ships a standalone **validation package** (`@mkven/multi-db-validation`) with **zero I/O dependencies** — clients can validate configs and queries locally before sending to the server. The core package (`@mkven/multi-db`) depends on it and adds planning, SQL generation, and masking, also with zero I/O deps. An **HTTP client package** (`@mkven/multi-db-client`) provides a typed client and a contract test suite — the same tests run against both in-process and HTTP implementations. Database drivers and cache clients live in separate executor/cache packages.
 
 ## Target Databases
 
@@ -1440,6 +1440,34 @@ Tests are split between packages. Validation package tests run without DB connec
 | 171 | Reload during in-flight query | `reloadMetadata()` called while `query()` is executing | in-flight query uses old config (snapshot); next query sees new config |
 | 172 | Executor timeout enforcement | orders query with pg-main timeoutMs: 100, slow query | `ExecutionError: QUERY_TIMEOUT` with `timeoutMs: 100` |
 
+#### `packages/client/tests/client/` — HTTP client behavior
+
+| # | Scenario | Input | Focus |
+|---|---|---|---|
+| 208 | Successful query via HTTP | POST /query with valid definition | response deserialized to `DataResult`, `kind: 'data'`, correct `meta` |
+| 209 | SQL-only mode via HTTP | POST /query with `executeMode: 'sql-only'` | response deserialized to `SqlResult`, `kind: 'sql'`, `sql` + `params` present |
+| 210 | Count mode via HTTP | POST /query with `executeMode: 'count'` | response deserialized to `CountResult`, `kind: 'count'`, `count` is number |
+| 211 | ValidationError deserialization | POST /query with unknown table → server returns 400 | client throws `ValidationError` with correct `code`, `instanceof` check passes |
+| 212 | ExecutionError deserialization | POST /query → server returns 500 with ExecutionError body | client throws `ExecutionError` with `code: 'QUERY_FAILED'`, `sql` + `params` preserved |
+| 213 | ConnectionError on network failure | POST /query to unreachable server | client throws `ConnectionError` with `code: 'NETWORK_ERROR'` |
+| 214 | Request timeout | POST /query to slow server, timeout: 100ms | client throws `ConnectionError` with `code: 'REQUEST_TIMEOUT'` |
+| 215 | Custom headers | POST /query with `headers: { Authorization: 'Bearer tok' }` | request includes custom header (verifiable via MSW interceptor) |
+| 216 | Local validation before send | `validateBeforeSend: true`, unknown table | `ValidationError` thrown without network request (no fetch call) |
+| 217 | Health check via HTTP | GET /health → server returns HealthCheckResult | client returns typed `HealthCheckResult` with executor/cache status |
+| 218 | Custom fetch injection | `fetch: mockFetch` in config | client uses injected fetch; verifiable by asserting on mock |
+
+#### `packages/client/tests/contract/` — contract tests (same suite, both implementations)
+
+| # | Scenario | Input | Contract assertion |
+|---|---|---|---|
+| 219 | Simple select | orders columns: [id, status] | both return `kind: 'data'`, same column count, same `meta.columns` structure |
+| 220 | Filter + join | orders JOIN products, filter status='active' | both return matching rows with same structure |
+| 221 | Aggregation | orders GROUP BY status, SUM(total) | both return same aggregation results |
+| 222 | Validation error | unknown table | both throw `ValidationError` with same `code` |
+| 223 | Access denied | restricted column (tenant-user) | both throw `ValidationError` with `ACCESS_DENIED` |
+| 224 | Count mode | orders (count) | both return `kind: 'count'` with same count |
+| 225 | SQL-only mode | orders (sql-only) | both return `kind: 'sql'`; SQL string may differ in formatting but params match |
+
 ### Sample Column Definitions (orders table)
 
 ```ts
@@ -1668,6 +1696,8 @@ const roles: RoleMeta[] = [
 | Concurrent safety | `query()` uses snapshot of metadata/roles; `reload*()` atomically swaps references | No locking needed — immutable config per query, atomic reference swap for reloads |
 | `close()` error handling | Attempt all providers, collect failures, throw aggregate error | Partial close would leak connections — always try all, report all failures |
 | Array columns | `ScalarColumnType` + `ArrayColumnType` union, 5 array operators, element type derived by stripping `[]` | All three backends (Postgres, ClickHouse, Trino/Iceberg) support arrays natively. Element type validation reuses `ScalarColumnType`. Array columns excluded from `QueryColumnFilter`, `sum`/`avg`/`min`/`max` aggregations, `groupBy`, and `orderBy` (dialect-inconsistent behavior) |
+| HTTP client | Thin typed wrapper over `fetch`; contract tests shared with in-process engine | Same test suite verifies both `MultiDb` (direct) and `MultiDbClient` (HTTP) — catches serialization drift, error mapping mismatches, and behavioral divergence. Native `fetch` = zero HTTP deps, works in Node 18+, Bun, Deno, browsers |
+| Contract testing | Parameterized test suite with factory function per implementation | Write once, run against any `QueryContract` — avoids duplicating integration tests for each transport |
 
 ---
 
@@ -1681,6 +1711,7 @@ const roles: RoleMeta[] = [
 | `@mkven/multi-db-executor-clickhouse` | ClickHouse connection + execution | `@clickhouse/client` |
 | `@mkven/multi-db-executor-trino` | Trino connection + execution | `trino-client` |
 | `@mkven/multi-db-cache-redis` | Redis cache provider (Debezium-synced) | `ioredis` |
+| `@mkven/multi-db-client` | Typed HTTP client + contract test suite | `@mkven/multi-db-validation` (types, errors; uses native `fetch`) |
 
 All error classes (including runtime ones like `ExecutionError`, `PlannerError`, `ConnectionError`) live in the validation package so that client code can use `instanceof` checks and access typed error fields without depending on the core package. The validation package is a type+error+validation-only package — it contains no I/O, no planner, no SQL generators.
 
@@ -1711,6 +1742,137 @@ interface MetadataIndex {
 ```
 
 Core has **zero I/O dependencies** — usable for SQL-only mode without any DB drivers. Each executor is a thin adapter that consumers install only if needed.
+
+---
+
+## HTTP Client & Contract Testing
+
+### HTTP API Contract
+
+The system defines a minimal HTTP API contract that any server wrapping `@mkven/multi-db` must implement:
+
+| Endpoint | Method | Request Body | Response Body |
+|---|---|---|---|
+| `/query` | POST | `{ definition, context }` | `QueryResult` (JSON, discriminated by `kind`) |
+| `/health` | GET | — | `HealthCheckResult` |
+
+Error responses use HTTP status codes with the error's `toJSON()` body:
+
+| Error Type | HTTP Status |
+|---|---|
+| `ValidationError` | 400 |
+| `ConfigError` | 400 |
+| `PlannerError` | 422 |
+| `ExecutionError` | 500 |
+| `ConnectionError` | 503 |
+| `ProviderError` | 503 |
+
+The contract is intentionally minimal — no auth, no routing framework, no middleware. The server wraps `multiDb.query()` and `multiDb.healthCheck()` and maps errors to status codes. Any HTTP framework (Express, Fastify, Hono, etc.) can implement it.
+
+### MultiDbClient
+
+```ts
+import { createMultiDbClient } from '@mkven/multi-db-client'
+
+const client = createMultiDbClient({ baseUrl: 'http://localhost:3000' })
+
+const result = await client.query({
+  definition: { from: 'orders', columns: ['id', 'total', 'status'] },
+  context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+})
+// result is QueryResult<T> — same type as multiDb.query()
+```
+
+```ts
+interface MultiDbClient {
+  query<T = unknown>(input: {
+    definition: QueryDefinition
+    context: ExecutionContext
+  }): Promise<QueryResult<T>>
+
+  healthCheck(): Promise<HealthCheckResult>
+}
+
+interface MultiDbClientConfig {
+  baseUrl: string                       // server URL (no trailing slash)
+  headers?: Record<string, string>      // e.g. { Authorization: 'Bearer ...' }
+  fetch?: typeof globalThis.fetch       // injectable for testing (MSW, custom interceptors)
+  timeout?: number                      // request timeout in ms (default: 30_000)
+  validateBeforeSend?: boolean          // pre-validate query locally (default: false)
+  metadata?: MetadataConfig             // required when validateBeforeSend is true
+  roles?: RoleMeta[]                    // required when validateBeforeSend is true
+}
+```
+
+Key behaviors:
+- **Error deserialization** — server returns `toJSON()` body; client reconstructs typed error classes (`ValidationError`, `ExecutionError`, etc.) using the `code` field. Callers use `instanceof` checks as usual — no transport-awareness needed
+- **Optional local validation** — when `validateBeforeSend: true`, calls `validateQuery()` from the validation package before sending. Fails fast with `ValidationError` without a network round trip. Requires metadata + roles to be provided in config
+- **Custom fetch** — injectable `fetch` function for testing. Default: `globalThis.fetch`. Enables MSW-based tests without a running server
+- **Timeout** — wraps the underlying `fetch` with `AbortController`; throws `ConnectionError` with code `REQUEST_TIMEOUT` on expiry
+- **No retry logic** — the client is intentionally simple. Callers handle retries at a higher level (middleware, wrapper, etc.)
+
+### Contract Testing
+
+Both `MultiDb` (in-process) and `MultiDbClient` (HTTP) implement the same query surface. The package exports a **contract test suite** that runs against both:
+
+```ts
+// Shared contract — both implementations satisfy this
+interface QueryContract {
+  query<T = unknown>(input: {
+    definition: QueryDefinition
+    context: ExecutionContext
+  }): Promise<QueryResult<T>>
+}
+```
+
+Contract tests are parameterized by a factory function:
+
+```ts
+// packages/client/src/contract/queryContract.ts
+export function describeQueryContract(name: string, factory: () => Promise<QueryContract>) {
+  describe(`QueryContract: ${name}`, () => {
+    let engine: QueryContract
+
+    beforeAll(async () => { engine = await factory() })
+
+    it('simple select', async () => {
+      const result = await engine.query({
+        definition: { from: 'orders', columns: ['id', 'status'] },
+        context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+      })
+      expect(result.kind).toBe('data')
+      expect(result.meta.columns).toHaveLength(2)
+    })
+
+    it('validation error', async () => {
+      await expect(engine.query({
+        definition: { from: 'nonexistent' },
+        context: { roles: { user: ['tenant-admin'] }, tenantId: 'abc' }
+      })).rejects.toThrow(ValidationError)
+    })
+
+    // ... all shared scenarios
+  })
+}
+```
+
+Each implementation provides a factory:
+
+```ts
+// Direct (in-process)
+describeQueryContract('direct', async () => {
+  const multiDb = await createMultiDb({ ... })
+  return multiDb
+})
+
+// HTTP client
+describeQueryContract('http-client', async () => {
+  const client = createMultiDbClient({ baseUrl: 'http://localhost:3000' })
+  return client
+})
+```
+
+This ensures both implementations behave identically — same results, same errors, same metadata structure. Catches serialization drift (e.g. `Date` vs ISO string), error mapping mismatches, and behavioral divergence before they reach production.
 
 ---
 
@@ -1784,6 +1946,21 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164, 166, 181–186, 188–189, 193, 194, 196, 197, 200–207
 │   │       ├── cache/               # scenario 35
 │   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152, 170–172
+│   │
+│   ├── client/                      # @mkven/multi-db-client
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   └── src/
+│   │       ├── index.ts             # public API: createMultiDbClient, MultiDbClient, MultiDbClientConfig
+│   │       ├── client.ts            # HTTP client implementation (fetch-based)
+│   │       ├── errors.ts            # error deserialization — toJSON() → typed error class reconstruction
+│   │       └── contract/
+│   │           └── queryContract.ts  # describeQueryContract — parameterized contract test suite
+│   │   └── tests/
+│   │       ├── fixtures/
+│   │       │   └── testConfig.ts     # shared test config for client tests
+│   │       ├── client/              # scenarios 208–218
+│   │       └── contract/            # scenarios 219–225
 │   │
 │   ├── executor-postgres/           # @mkven/multi-db-executor-postgres
 │   │   ├── package.json
