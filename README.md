@@ -550,7 +550,9 @@ Given a query touching tables T1, T2, ... Tn:
 
 All validation errors are descriptive and include what was expected vs what was provided.
 
-### Error Handling
+---
+
+## Error Handling
 
 All errors are thrown as typed exceptions (never returned in the result). Error types:
 
@@ -559,14 +561,19 @@ class MultiDbError extends Error {
   code: string                        // machine-readable error code
 }
 
+class ConfigError extends MultiDbError {
+  code: 'INVALID_API_NAME' | 'DUPLICATE_API_NAME' | 'INVALID_REFERENCE' | 'INVALID_RELATION'
+  details: { entity?: string; field?: string; expected?: string; actual?: string }
+}
+
 class ValidationError extends MultiDbError {
-  code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_API_NAME'
-  details: { expected?: string; actual?: string; table?: string; column?: string }
+  code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN'
+  details: { expected?: string; actual?: string; table?: string; column?: string; role?: string }
 }
 
 class PlannerError extends MultiDbError {
-  code: 'UNREACHABLE_TABLES' | 'TRINO_DISABLED' | 'NO_CATALOG'
-  details: { unreachableTables?: string[]; missingCatalogs?: string[] }
+  code: 'UNREACHABLE_TABLES' | 'TRINO_DISABLED' | 'NO_CATALOG' | 'FRESHNESS_UNMET'
+  details: { unreachableTables?: string[]; missingCatalogs?: string[]; requiredFreshness?: string; availableLag?: string }
 }
 
 class ExecutionError extends MultiDbError {
@@ -574,6 +581,8 @@ class ExecutionError extends MultiDbError {
   details: { database?: string; originalError?: Error }
 }
 ```
+
+`ConfigError` is thrown at init time (invalid apiNames, duplicate names, broken DB/table/relation references). `ValidationError` is thrown per query. `PlannerError` is thrown when no execution strategy can satisfy the query. `ExecutionError` is thrown during SQL execution or cache access.
 
 ---
 
