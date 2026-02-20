@@ -642,7 +642,7 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; malformed compound values (`between` missing `to`, `levenshtein_lte` with negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
@@ -686,6 +686,11 @@ All errors are thrown as typed exceptions (never returned in the result). Error 
 ```ts
 class MultiDbError extends Error {
   code: string                        // machine-readable error code
+
+  toJSON(): Record<string, unknown>   // safe serialization for logging / API responses
+  // Returns { code, message, ...details }. Recursively serializes `cause` and `errors[]`.
+  // Error objects don't serialize with JSON.stringify by default — this ensures all
+  // diagnostic info survives logging pipelines, structured loggers, and HTTP transports.
 }
 
 class ConfigError extends MultiDbError {
@@ -693,26 +698,45 @@ class ConfigError extends MultiDbError {
   errors: {
     code: 'INVALID_API_NAME' | 'DUPLICATE_API_NAME' | 'INVALID_REFERENCE' | 'INVALID_RELATION' | 'INVALID_SYNC' | 'INVALID_CACHE'
     message: string
-    details: { entity?: string; field?: string; expected?: string; actual?: string }
+    details: { entity?: string; field?: string; expected?: string; actual?: string; database?: string; cacheId?: string }
+                                      // database: for INVALID_SYNC / INVALID_REFERENCE — which database is involved
+                                      // cacheId: for INVALID_CACHE — which cache config failed
   }[]
 }
 
 class ConnectionError extends MultiDbError {
   code: 'CONNECTION_FAILED'
-  details: { unreachable: { id: string; type: 'executor' | 'cache'; cause?: Error }[] }
+  details: {
+    unreachable: {
+      id: string                      // provider id (DatabaseMeta.id or CacheMeta.id)
+      type: 'executor' | 'cache'
+      engine?: 'postgres' | 'clickhouse' | 'trino' | 'redis'  // which engine failed — helps troubleshooting
+      cause?: Error
+    }[]
+  }
 }
 
 class ValidationError extends MultiDbError {
   code: 'VALIDATION_FAILED'           // always this code — individual issues are in `errors`
+  fromTable: string                   // the query's `from` table — correlates error to query
   errors: {
-    code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'UNKNOWN_ROLE' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_GROUP_BY' | 'INVALID_HAVING' | 'INVALID_ORDER_BY' | 'INVALID_BY_IDS' | 'INVALID_LIMIT' | 'INVALID_EXISTS' | 'INVALID_AGGREGATION'
+    code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'UNKNOWN_ROLE' | 'ACCESS_DENIED'
+         | 'INVALID_FILTER' | 'INVALID_VALUE' | 'INVALID_JOIN' | 'INVALID_GROUP_BY'
+         | 'INVALID_HAVING' | 'INVALID_ORDER_BY' | 'INVALID_BY_IDS' | 'INVALID_LIMIT'
+         | 'INVALID_EXISTS' | 'INVALID_AGGREGATION'
     message: string
-    details: { expected?: string; actual?: string; table?: string; column?: string; role?: string; alias?: string; operator?: string }
+    details: {
+      expected?: string; actual?: string
+      table?: string; column?: string; role?: string; alias?: string; operator?: string
+      refColumn?: string; refTable?: string    // for QueryColumnFilter errors — the right-side column/table
+      filterIndex?: number                     // zero-based index into filters[] — identifies which filter failed
+    }
   }[]
 }
 
 class PlannerError extends MultiDbError {
   code: 'UNREACHABLE_TABLES' | 'TRINO_DISABLED' | 'NO_CATALOG' | 'FRESHNESS_UNMET'
+  fromTable: string                   // the query's `from` table — correlates error to query
   details:
     | { code: 'UNREACHABLE_TABLES'; tables: string[] }
     | { code: 'TRINO_DISABLED' }       // no additional detail needed
@@ -721,11 +745,14 @@ class PlannerError extends MultiDbError {
 }
 
 class ExecutionError extends MultiDbError {
-  code: 'EXECUTOR_MISSING' | 'CACHE_PROVIDER_MISSING' | 'QUERY_FAILED'
+  code: 'EXECUTOR_MISSING' | 'CACHE_PROVIDER_MISSING' | 'QUERY_FAILED' | 'QUERY_TIMEOUT'
   details:
     | { code: 'EXECUTOR_MISSING'; database: string }        // DatabaseMeta.id
     | { code: 'CACHE_PROVIDER_MISSING'; cacheId: string }   // CacheMeta.id
-    | { code: 'QUERY_FAILED'; database: string; sql: string; params: unknown[]; cause?: Error }  // sql + params for debugging; cause = original DB error (ES2022 Error.cause)
+    | { code: 'QUERY_FAILED'; database: string; dialect: 'postgres' | 'clickhouse' | 'trino'; sql: string; params: unknown[]; cause?: Error }
+    | { code: 'QUERY_TIMEOUT'; database: string; dialect: 'postgres' | 'clickhouse' | 'trino'; sql: string; timeoutMs: number }
+                                      // QUERY_FAILED: sql + params + dialect for debugging; cause = original DB error (ES2022 Error.cause)
+                                      // QUERY_TIMEOUT: when executor-level timeout is exceeded; timeoutMs = configured limit
 }
 
 class ProviderError extends MultiDbError {
@@ -737,7 +764,9 @@ class ProviderError extends MultiDbError {
 
 The top-level `Error.message` for multi-error types summarizes the count: e.g. `"Config invalid: 3 errors"` for `ConfigError`, `"Validation failed: 5 errors"` for `ValidationError`. Individual `errors[].message` provides per-issue detail.
 
-`ConfigError` is thrown at init time and during `reloadMetadata()` — it collects **all** config issues (invalid apiNames, duplicate names, broken references, broken relations, broken sync references, invalid cache configs) into a single error with an `errors[]` array, same philosophy as `ValidationError`. `ConnectionError` is thrown at init time when executor/cache pings fail — conceptually distinct from config validation (config is correct, infrastructure is unreachable). Each unreachable entry carries `cause?: Error` to preserve the original ping failure (stack trace, message). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. `PlannerError` is thrown when no execution strategy can satisfy the query — `details` is a discriminated union keyed by `code`, so each variant carries only its relevant fields. `ExecutionError` is thrown during SQL execution or cache access — `details` is a discriminated union keyed by `code` (`QUERY_FAILED` includes `sql` + `params` + `cause`, `EXECUTOR_MISSING` includes `database`, `CACHE_PROVIDER_MISSING` includes `cacheId`). `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails — at init time or during `reloadMetadata()` / `reloadRoles()`. Both `ExecutionError` and `ProviderError` use ES2022 `Error.cause` to chain the original error instead of a custom field.
+`MultiDbError.toJSON()` returns a plain object safe for `JSON.stringify()`, structured loggers, and HTTP error responses. It recursively serializes `cause` (if present) and `errors[]` arrays, so all diagnostic data survives transport. Standard `Error` objects lose all custom fields during `JSON.stringify()` — `toJSON()` ensures `code`, `details`, `message`, and `cause` are always included.
+
+`ConfigError` is thrown at init time and during `reloadMetadata()` — it collects **all** config issues (invalid apiNames, duplicate names, broken references, broken relations, broken sync references, invalid cache configs) into a single error with an `errors[]` array, same philosophy as `ValidationError`. Each error's `details` includes `database` / `cacheId` when relevant, so the caller knows exactly which database or cache config is broken. `ConnectionError` is thrown at init time when executor/cache pings fail — conceptually distinct from config validation (config is correct, infrastructure is unreachable). Each unreachable entry carries `engine` (postgres/clickhouse/trino/redis) and `cause?: Error` to preserve the original ping failure (stack trace, message). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. It carries `fromTable` to correlate the error to the specific query. Individual errors include `filterIndex` (zero-based) to identify which filter caused the issue, and `refColumn` / `refTable` for `QueryColumnFilter` errors. `INVALID_VALUE` is used for structurally malformed compound values (missing `to` in `between`, negative `maxDistance` in `levenshtein_lte`, empty array in `in`) — distinct from `INVALID_FILTER` which covers type/operator mismatches. `PlannerError` is thrown when no execution strategy can satisfy the query — `details` is a discriminated union keyed by `code`, so each variant carries only its relevant fields. It also carries `fromTable` to correlate to the query. `ExecutionError` is thrown during SQL execution or cache access — `details` is a discriminated union keyed by `code` (`QUERY_FAILED` includes `sql` + `params` + `dialect` + `cause`, `QUERY_TIMEOUT` includes `sql` + `timeoutMs` + `dialect`, `EXECUTOR_MISSING` includes `database`, `CACHE_PROVIDER_MISSING` includes `cacheId`). The `dialect` field in `QUERY_FAILED` and `QUERY_TIMEOUT` tells the caller which engine failed — essential when debugging Trino cross-catalog queries vs direct Postgres/ClickHouse. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails — at init time or during `reloadMetadata()` / `reloadRoles()`. Both `ExecutionError` and `ProviderError` use ES2022 `Error.cause` to chain the original error instead of a custom field.
 
 ---
 
@@ -1075,9 +1104,9 @@ Tests are split between packages. Validation package tests run without DB connec
 | 117 | `contains` on non-string | orders WHERE total contains '100' | rule 5 — INVALID_FILTER (decimal column) |
 | 118 | Column filter type mismatch | orders WHERE total(decimal) > status(string) | rule 5 — INVALID_FILTER (incompatible types) |
 | 119 | Column filter on denied column | orders WHERE internalNote > status (tenant-user) | rule 4 — ACCESS_DENIED (column in filter) |
-| 120 | `between` malformed value | orders WHERE total between { from: 100 } (missing `to`) | rule 5 — INVALID_FILTER (malformed compound value) |
-| 121 | `levenshtein_lte` negative maxDistance | users WHERE lastName levenshtein_lte { text: 'x', maxDistance: -1 } | rule 5 — INVALID_FILTER (maxDistance must be ≥ 0) |
-| 122 | `in` with empty array | orders WHERE status in [] | rule 5 — INVALID_FILTER (empty array produces invalid SQL) |
+| 120 | `between` malformed value | orders WHERE total between { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value) |
+| 121 | `levenshtein_lte` negative maxDistance | users WHERE lastName levenshtein_lte { text: 'x', maxDistance: -1 } | rule 5 — INVALID_VALUE (maxDistance must be ≥ 0) |
+| 122 | `in` with empty array | orders WHERE status in [] | rule 5 — INVALID_VALUE (empty array produces invalid SQL) |
 | 123 | Column filter non-existent refColumn | orders WHERE total > nonexistent (QueryColumnFilter) | rule 2 — UNKNOWN_COLUMN (refColumn side) |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
@@ -1199,7 +1228,9 @@ Tests are split between packages. Validation package tests run without DB connec
 | 39 | Debug mode | orders (debug: true) | result includes debugLog entries |
 | 44 | Executor missing | events (no ch-analytics executor) | ExecutionError: EXECUTOR_MISSING |
 | 48 | Cache provider missing | users byIds=[1] (no redis provider) | ExecutionError: CACHE_PROVIDER_MISSING |
-| 58 | Query execution fails | orders (executor throws at runtime) | ExecutionError: QUERY_FAILED (includes sql + params) |
+| 58 | Query execution fails | orders (executor throws at runtime) | ExecutionError: QUERY_FAILED (includes sql + params + dialect) |
+| 131 | Query timeout | orders (executor exceeds timeoutMs) | ExecutionError: QUERY_TIMEOUT (includes sql + timeoutMs + dialect) |
+| 132 | Error toJSON() serialization | any error type | toJSON() returns plain object, cause chain preserved, JSON.stringify() safe |
 | 60 | Health check | all executors + cache providers | healthCheck() returns per-provider status |
 | 61 | Hot-reload metadata | reloadMetadata() with new table added | next query sees new table |
 | 62 | Reload failure | reloadRoles() with failing provider | ProviderError, old config preserved |
@@ -1535,7 +1566,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
 │   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129
 │   │       ├── cache/               # scenario 35
-│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105
+│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132
 │   │
 │   ├── executor-postgres/           # @mkven/multi-db-executor-postgres
 │   │   ├── package.json
