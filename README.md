@@ -224,6 +224,50 @@ interface MultiDbConfig {
 
 Metadata source is **abstracted** — hardcoded for now, in future loaded from a database or external service and cached.
 
+### Metadata & Role Providers
+
+The config can be provided statically or loaded dynamically via providers:
+
+```ts
+interface MetadataProvider {
+  load(): Promise<Omit<MultiDbConfig, 'roles'>>
+}
+
+interface RoleProvider {
+  load(): Promise<RoleMeta[]>
+}
+```
+
+Providers are optional — if omitted, the system uses the static `config` object. Both providers support cache invalidation:
+
+```ts
+interface MultiDb {
+  query<T = unknown>(input: {
+    definition: QueryDefinition
+    context: ExecutionContext
+  }): Promise<QueryResult<T>>
+
+  reloadMetadata(): Promise<void>     // re-calls MetadataProvider.load(), rebuilds indexes
+  reloadRoles(): Promise<void>        // re-calls RoleProvider.load(), rebuilds role map
+}
+```
+
+External systems signal staleness by calling `reloadMetadata()` or `reloadRoles()`. This is explicit — no polling, no TTL. Typical triggers: admin UI saves new config, CI/CD deploys schema changes, webhook from config service.
+
+```ts
+const multiDb = createMultiDb({
+  // Static config OR providers (not both)
+  configProvider: myMetadataProvider,
+  roleProvider: myRoleProvider,
+
+  executors: { ... },
+  cacheProviders: { ... },
+})
+
+// Later, when external system signals config change:
+await multiDb.reloadMetadata()
+```
+
 ### Module Return Type
 
 ```ts
@@ -548,6 +592,9 @@ Given a query touching tables T1, T2, ... Tn:
 5. **Filter validity** — filter operators must be valid for the column type
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
+8. **Having validity** — `having` filters must reference aliases defined in `aggregations`
+9. **Order By validity** — `orderBy` must reference columns from `from` table or joined tables
+10. **ByIds validity** — `byIds` requires a single-column primary key; cannot combine with `groupBy` or `aggregations`
 
 All validation errors are descriptive and include what was expected vs what was provided.
 
@@ -568,7 +615,7 @@ class ConfigError extends MultiDbError {
 }
 
 class ValidationError extends MultiDbError {
-  code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_GROUP_BY'
+  code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_GROUP_BY' | 'INVALID_HAVING' | 'INVALID_ORDER_BY' | 'INVALID_BY_IDS'
   details: { expected?: string; actual?: string; table?: string; column?: string; role?: string }
 }
 
