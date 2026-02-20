@@ -478,6 +478,10 @@ interface QueryJoin {
   type?: 'inner' | 'left'            // default: 'left' (safe for nullable FKs)
   columns?: string[]                  // columns to select from joined table; undefined = all allowed for role; [] = no columns (join used for filter/groupBy only)
   filters?: (QueryFilter | QueryColumnFilter | QueryFilterGroup | QueryExistsFilter)[]  // filters on joined table
+  // NOTE: Join filters are placed in WHERE, not ON. The ON clause only contains the join condition
+  // (FK = PK from relation metadata). For LEFT JOINs this means join-scoped filters effectively
+  // convert to INNER JOIN semantics — rows where the joined table doesn't match the filter are
+  // excluded. This is intentional: if you filter on a joined table, you want matching rows only.
 }
 
 interface QueryFilter {
@@ -594,7 +598,7 @@ interface DebugLogEntry {
 }
 ```
 
-When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, `offset`, `distinct`, `groupBy`, `aggregations`, and `having` are all ignored (always emits `SELECT COUNT(*) FROM ...`, never grouped counts); `filters` and `joins` remain active (they affect which rows are counted); `meta.columns` is an empty array since no columns are selected. All modes include metadata. Debug log is included only when `debug: true`.
+When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, `offset`, `distinct`, `groupBy`, `aggregations`, and `having` are all ignored (always emits `SELECT COUNT(*) FROM ...`, never grouped counts); `filters` and `joins` remain active (they affect which rows are counted); `meta.columns` is an empty array since no columns are selected. `byIds` + `count` is valid — it counts how many of the provided IDs actually exist (`SELECT COUNT(*) FROM ... WHERE id = ANY($1)`). All modes include metadata. Debug log is included only when `debug: true`.
 
 In `sql-only` mode, masking cannot be applied (no data to mask). However, `meta.columns[].masked` still reports masking intent so the caller can apply masking themselves after execution.
 
@@ -645,10 +649,10 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; malformed compound values (`between`/`not_between` missing `to`, `levenshtein_lte` with negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `in`/`not_in` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; malformed compound values (`between`/`not_between` missing `to`, `levenshtein_lte` with negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `in`/`not_in` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`not_in` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
-8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
+8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
 9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided; `offset` requires `limit` (offset without limit is rejected)
@@ -816,7 +820,8 @@ This decouples the API contract from database schema evolution.
 |---|---|---|---|
 | Identifier quoting | `"column"` | `` `column` `` | `"column"` |
 | Parameter binding | `$1, $2` | `{p1:Type}` | `?` |
-| Arrays | `= ANY($1)` | `arrayJoin` | `UNNEST` |
+| `in` | `= ANY($1::type[])` | `IN tuple(v1, v2, ...)` | `IN (?, ?, ...)` (param expansion) |
+| `not_in` | `<> ALL($1::type[])` | `NOT IN tuple(v1, v2, ...)` | `NOT IN (?, ?, ...)` (param expansion) |
 | Date functions | `date_trunc(...)` | `toStartOfDay(...)` | `date_trunc(...)` |
 | LIMIT/OFFSET | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` |
 | Case-insensitive LIKE | `ILIKE` | `ilike(col, pattern)` | `lower(col) LIKE lower(pattern)` |
@@ -1239,6 +1244,8 @@ Tests are split between packages. Validation package tests run without DB connec
 | 144 | NOT in HAVING group | orders GROUP BY status, HAVING NOT (SUM(total) > 100 OR COUNT(*) > 5) | `NOT (HAVING_cond1 OR HAVING_cond2)` — negated HAVING group |
 | 145 | `not_between` malformed value | orders WHERE total not_between { from: 100 } (missing `to`) | `ValidationError` — `INVALID_VALUE` (malformed compound value, same as between) |
 | 146 | `not_in` on date column | orders WHERE createdAt not_in ['2024-01-01'] | `ValidationError` — rule 5: `not_in` rejected on `timestamp` type |
+| 150 | `in` with null element | orders WHERE status IN ('active', null) | `ValidationError` — `INVALID_VALUE`: null in `in`/`not_in` array rejected (NOT IN + NULL = 0 rows) |
+| 151 | QueryColumnFilter in HAVING group | orders GROUP BY status, HAVING group with QueryColumnFilter { column: 'totalSum', refColumn: 'avgTotal' } | `ValidationError` — HAVING rejects `QueryColumnFilter` (aliases, not table columns) |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1253,6 +1260,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 14e | Count mode | orders (count) | returns count only |
 | 31 | SQL-only mode | orders (sql-only) | returns SqlResult with sql + params |
 | 39 | Debug mode | orders (debug: true) | result includes debugLog entries |
+| 152 | byIds + count mode | users byIds=[1,2,3] (count) | `SELECT COUNT(*) FROM ... WHERE id = ANY($1)` — counts existing IDs |
 | 44 | Executor missing | events (no ch-analytics executor) | ExecutionError: EXECUTOR_MISSING |
 | 48 | Cache provider missing | users byIds=[1] (no redis provider) | ExecutionError: CACHE_PROVIDER_MISSING |
 | 58 | Query execution fails | orders (executor throws at runtime) | ExecutionError: QUERY_FAILED (includes sql + params + dialect) |
@@ -1556,7 +1564,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1594,7 +1602,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
 │   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149
 │   │       ├── cache/               # scenario 35
-│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132
+│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152
 │   │
 │   ├── executor-postgres/           # @mkven/multi-db-executor-postgres
 │   │   ├── package.json
