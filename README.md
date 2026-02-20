@@ -1028,6 +1028,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 16 | Column trimming on byIds | users byIds + limited columns in role | only intersected columns |
 | 38 | Columns omitted | orders (no columns specified, tenant-user) | returns only role-allowed columns |
 | 95 | Empty scope intersection | events (analytics-reader user + orders-service) | service scope excludes events → ACCESS_DENIED |
+| 104 | Empty roles array | orders (user: []) | zero roles → zero permissions → ACCESS_DENIED |
 
 #### `packages/core/tests/planner/` — strategy selection (P0–P4)
 
@@ -1052,6 +1053,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 59 | Unreachable tables | metrics + tenants (no replica, no trino catalog) | PlannerError: UNREACHABLE_TABLES |
 | 64 | Multi-table join (3 tables) | orders + products + users (all pg-main) | direct → pg-main, 2 JOINs |
 | 79 | Single Iceberg table query | ordersArchive | direct via trino executor (Trino dialect, single catalog) |
+| 103 | Cache column subset → P0 skip | users byIds=[1,2], query columns include 'createdAt' but cache only has subset | skip cache → direct DB |
 
 #### `packages/core/tests/generator/` — SQL generation per dialect
 
@@ -1088,6 +1090,10 @@ Tests are split between packages. Validation package tests run without DB connec
 | 92 | Trino cross-catalog SQL | orders (pg-main) + events (ch-analytics) via Trino | `pg_main.public.orders` cross-catalog references |
 | 93 | COUNT(*) aggregation | orders COUNT(*) as totalOrders | `SELECT COUNT(*) as "totalOrders" FROM ...` |
 | 94 | Dialect: parameter binding | orders WHERE status = 'active' | PG: `$1`, CH: `{p1:String}`, Trino: `?` |
+| 99 | `!=` filter | orders WHERE status != 'cancelled' | `!=` / `<>` per dialect |
+| 100 | `not_ilike` filter | users WHERE email NOT ILIKE '%@test%' | dialect-specific NOT ILIKE |
+| 101 | `>=` / `<=` filters | orders WHERE total >= 100 AND total <= 500 | range comparison |
+| 102 | MIN/MAX aggregations | orders MIN(createdAt) as earliest, MAX(createdAt) as latest | MIN/MAX preserve source type (timestamp) |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1109,6 +1115,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 61 | Hot-reload metadata | reloadMetadata() with new table added | next query sees new table |
 | 62 | Reload failure | reloadRoles() with failing provider | ProviderError, old config preserved |
 | 76 | Count + groupBy ignored | orders GROUP BY status, SUM(total) (count mode) | groupBy/aggregations/having ignored, returns scalar count |
+| 105 | close() lifecycle | call multiDb.close() | all executors + cache providers closed, subsequent queries throw |
 
 ### Sample Column Definitions (orders table)
 
@@ -1423,11 +1430,11 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (reuses validation fixtures + adds executors)
 │   │       ├── init/                # scenarios 53, 54, 55, 63
-│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95
-│   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94
+│   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104
+│   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102
 │   │       ├── cache/               # scenario 35
-│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76
+│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105
 │   │
 │   ├── executor-postgres/           # @mkven/multi-db-executor-postgres
 │   │   ├── package.json
