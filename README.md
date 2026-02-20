@@ -1246,12 +1246,12 @@ Tests are split between packages. Validation package tests run without DB connec
 | 141 | `table` in having filter rejected | orders GROUP BY status, HAVING { column: 'totalSum', table: 'orders' } | rule 8 — `table` not allowed in `having` filters |
 | 143 | byIds with composite PK | orders byIds=[1,2] but table has composite PK [tenantId, id] | rule 10 — byIds requires single-column primary key |
 | 145 | `notBetween` malformed value | orders WHERE total notBetween { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value, same as between) |
-| 146 | `notIn` on date column | orders WHERE createdAt notIn ['2024-01-01'] | rule 5 — `notIn` rejected on `timestamp` type |
+| 146 | `notIn` on timestamp column | orders WHERE createdAt notIn ['2024-01-01'] | rule 5 — `notIn` rejected on `timestamp` type |
 | 150 | `in` with null element | orders WHERE status IN ('active', null) | rule 5 — INVALID_VALUE: null in `in`/`notIn` array rejected (NOT IN + NULL = 0 rows) |
 | 151 | QueryColumnFilter in HAVING group | orders GROUP BY status, HAVING group with QueryColumnFilter { column: 'totalSum', refColumn: 'avgTotal' } | rule 8 — HAVING rejects `QueryColumnFilter` (aliases, not table columns) |
 | 153 | `contains` operator in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'contains', value: '100' } | rule 8 — INVALID_HAVING: pattern operators rejected in HAVING |
 | 154 | `levenshteinLte` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'levenshteinLte', value: { text: '100', maxDistance: 1 } } | rule 8 — INVALID_HAVING: function operators rejected in HAVING |
-| 165 | Nested EXISTS | orders EXISTS(invoices WHERE EXISTS(users WHERE role='admin')) | rule 12 — inner EXISTS resolves `users` relation against `invoices` (outer EXISTS table), not `orders` |
+| 165 | Nested EXISTS (invalid relation) | orders EXISTS(invoices WHERE EXISTS(users WHERE role='admin')) | rule 12 — INVALID_EXISTS: inner EXISTS resolves `users` against `invoices` (outer EXISTS), not `orders`; invoices has no relation to users → rejected |
 | 167 | `levenshteinLte` fractional maxDistance | users WHERE lastName levenshteinLte { text: 'x', maxDistance: 1.5 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
 | 168 | `between` with null `from` | orders WHERE total between { from: null, to: 100 } | rule 5 — INVALID_VALUE (`from`/`to` must not be null — SQL BETWEEN NULL always false) |
 | 169 | `notBetween` with null `to` | orders WHERE total notBetween { from: 0, to: null } | rule 5 — INVALID_VALUE (same rationale as `between` null rejection) |
@@ -1270,6 +1270,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 195 | `between` value type mismatch | orders WHERE total BETWEEN 'abc' AND 'xyz' (total is decimal) | rule 5 — INVALID_VALUE (`from`/`to` must match column type) |
 | 198 | Array column in GROUP BY | orders GROUP BY priorities, COUNT(*) as cnt | rule 7 — INVALID_GROUP_BY (array columns rejected in GROUP BY) |
 | 199 | Array column in ORDER BY | orders ORDER BY priorities ASC | rule 9 — INVALID_ORDER_BY (array columns rejected in ORDER BY) |
+| 229 | `notIn` on date column | invoices WHERE dueDate notIn ['2024-06-01'] | rule 5 — INVALID_FILTER (`notIn` rejected on `date` type) |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1414,6 +1415,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 205 | Array filter in AND group | products WHERE (labels arrayContainsAny ['sale'] AND price > 10) | `(t0."labels" && $1::text[] AND t0."price" > $2)` — array filter inside `QueryFilterGroup` |
 | 206 | Array filter on joined table | orders JOIN products, filter: { column: 'labels', table: 'products', operator: 'arrayContainsAny', value: ['sale'] } | `t1."labels" && $1::text[]` — array filter using `table` qualifier on joined table column |
 | 207 | `arrayContainsAll` single element | products WHERE labels arrayContainsAll ['sale'] | PG: `t0."labels" @> $1::text[]` — single-element array is valid (same syntax, param is `['sale']`) |
+| 227 | Nested EXISTS (valid) | orders EXISTS(invoices WHERE EXISTS(tenants)) | `EXISTS (SELECT 1 FROM invoices t1 WHERE t1."order_id" = t0."id" AND EXISTS (SELECT 1 FROM tenants t2 WHERE t2."id" = t1."tenant_id"))` — inner EXISTS resolves tenants against invoices (parent) |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1442,6 +1444,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 170 | close() partial failure | 2 executors, 1 cache; executor pg-tenant close() throws | all 3 close() calls attempted; thrown error lists pg-tenant failure; subsequent queries throw EXECUTOR_MISSING |
 | 171 | Reload during in-flight query | `reloadMetadata()` called while `query()` is executing | in-flight query uses old config (snapshot); next query sees new config |
 | 172 | Executor timeout enforcement | orders query with pg-main timeoutMs: 100, slow query | `ExecutionError: QUERY_TIMEOUT` with `timeoutMs: 100` |
+| 228 | Reload with invalid config | `reloadMetadata()` with provider returning invalid apiName | `ConfigError: CONFIG_INVALID`, old config preserved — next query still works with previous metadata |
 
 #### `packages/client/tests/client/` — HTTP client behavior
 
@@ -1911,7 +1914,7 @@ This ensures both implementations behave identically — same results, same erro
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180, 187, 190–192, 195, 198, 199
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180, 187, 190–192, 195, 198, 199, 229
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1947,9 +1950,9 @@ This ensures both implementations behave identically — same results, same erro
 │   │       ├── init/                # scenarios 53, 54, 55, 63
 │   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164, 166, 181–186, 188–189, 193, 194, 196, 197, 200–207
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164, 166, 181–186, 188–189, 193, 194, 196, 197, 200–207, 227
 │   │       ├── cache/               # scenario 35
-│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152, 170–172
+│   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152, 170–172, 228
 │   │
 │   ├── client/                      # @mkven/multi-db-client
 │   │   ├── package.json
