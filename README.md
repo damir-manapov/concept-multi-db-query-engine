@@ -482,8 +482,9 @@ interface QueryJoin {
 
 interface QueryFilter {
   column: string                      // apiName (or aggregation alias when used in `having`)
-  operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not_in' | 'like' | 'not_like' | 'ilike' | 'not_ilike' | 'is_null' | 'is_not_null'
+  operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not_in' | 'like' | 'not_like' | 'ilike' | 'not_ilike' | 'is_null' | 'is_not_null' | 'levenshtein_lte'
   value?: unknown                     // scalar for most operators; array for 'in'/'not_in'; omit for 'is_null'/'is_not_null'
+                                      // for 'levenshtein_lte': { text: string, maxDistance: number }
 }
 
 interface QueryFilterGroup {
@@ -652,10 +653,11 @@ All validation errors are **collected, not thrown one at a time**. The system ru
 | `like` `not_like` | ✓ | — | — | — | — | — | — |
 | `ilike` `not_ilike` | ✓ | — | — | — | — | — | — |
 | `is_null` `is_not_null` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
+| `levenshtein_lte` | ✓ | — | — | — | — | — | — |
 
 \* `is_null` / `is_not_null` are valid on any type but only on columns with `nullable: true`.
 
-Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`not_in` are rejected on `date`/`timestamp` — use range comparisons instead. `like`/`ilike` are string-only.
+Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`not_in` are rejected on `date`/`timestamp` — use range comparisons instead. `like`/`ilike` are string-only. `levenshtein_lte` is string-only — it matches rows where the Levenshtein edit distance between the column value and the target text is ≤ `maxDistance`. No index support in any dialect — always a full scan. PostgreSQL requires the `fuzzystrmatch` extension (`CREATE EXTENSION fuzzystrmatch`).
 
 ---
 
@@ -763,6 +765,7 @@ This decouples the API contract from database schema evolution.
 | Date functions | `date_trunc(...)` | `toStartOfDay(...)` | `date_trunc(...)` |
 | LIMIT/OFFSET | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` |
 | Case-insensitive LIKE | `ILIKE` | `ilike(col, pattern)` | `lower(col) LIKE lower(pattern)` |
+| Levenshtein distance | `levenshtein(col, $1) <= $2` | `editDistance(col, {p1:String}) <= {p2:UInt32}` | `levenshtein_distance(col, ?) <= ?` |
 | Boolean | `true/false` | `1/0` | `true/false` |
 
 Each engine gets a `SqlDialect` implementation.
@@ -818,7 +821,16 @@ interface SqlParts {
 }
 
 // Recursive WHERE tree — mirrors QueryFilterGroup at the physical level
-type WhereNode = WhereCondition | WhereGroup | WhereExists
+type WhereNode = WhereCondition | WhereFunction | WhereGroup | WhereExists
+
+// Function-based condition — for operators that wrap the column in a function (e.g. levenshtein_lte)
+interface WhereFunction {
+  fn: string                          // dialect resolves to actual function name (e.g. 'levenshtein', 'editDistance', 'levenshtein_distance')
+  column: ColumnRef
+  fnParamIndex: number                // param index for the function argument (the target text)
+  operator: string                    // comparison operator applied to the function result (e.g. '<=')
+  compareParamIndex: number           // param index for the comparison value (the max distance)
+}
 
 // HAVING tree — same as WhereNode but excludes EXISTS (EXISTS in HAVING is not valid SQL)
 type HavingNode = WhereCondition | HavingGroup
@@ -1025,6 +1037,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 97 | Offset without limit | orders offset: 10 (no limit) | rule 11 — INVALID_LIMIT |
 | 98 | Filter on joined non-existent column | orders JOIN products, filter: products.nonexistent = 'x' | rule 2 — UNKNOWN_COLUMN |
 | 107 | `is_null` on non-nullable | orders WHERE id IS NULL (id: nullable=false) | rule 5 — INVALID_FILTER |
+| 109 | `levenshtein_lte` on non-string | orders WHERE total levenshtein_lte { text: '100', maxDistance: 1 } | rule 5 — INVALID_FILTER (decimal column) |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1115,6 +1128,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 100 | `not_ilike` filter | users WHERE email NOT ILIKE '%@test%' | dialect-specific NOT ILIKE |
 | 101 | `>=` / `<=` filters | orders WHERE total >= 100 AND total <= 500 | range comparison |
 | 102 | MIN/MAX aggregations | orders MIN(createdAt) as earliest, MAX(createdAt) as latest | MIN/MAX preserve source type (timestamp) |
+| 108 | `levenshtein_lte` filter | users WHERE lastName levenshtein_lte { text: 'smith', maxDistance: 2 } | PG: `levenshtein(col,$1)<=$2`, CH: `editDistance(col,{p1:String})<={p2:UInt32}`, Trino: `levenshtein_distance(col,?)<= ?` |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1428,7 +1442,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1464,7 +1478,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── init/                # scenarios 53, 54, 55, 63
 │   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108
 │   │       ├── cache/               # scenario 35
 │   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105
 │   │
