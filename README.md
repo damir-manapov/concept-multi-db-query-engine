@@ -244,7 +244,7 @@ const metadataProvider = staticMetadata({ databases: [...], tables: [...], ... }
 const roleProvider = staticRoles([...])
 ```
 
-Both providers support cache invalidation:
+The MultiDb instance exposes reload and lifecycle methods:
 
 ```ts
 interface MultiDb {
@@ -318,11 +318,19 @@ import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
 import { createTrinoExecutor } from '@mkven/multi-db-executor-trino'
 import { createRedisCache } from '@mkven/multi-db-cache-redis'
 
+```ts
+interface CreateMultiDbOptions {
+  metadataProvider: MetadataProvider
+  roleProvider: RoleProvider
+  executors?: Record<string, DbExecutor>
+  cacheProviders?: Record<string, CacheProvider>
+  validateConnections?: boolean        // default: true — ping all executors/caches at startup
+}
+```
+
+```ts
 // Returns Promise<MultiDb> — async because it loads providers and pings connections
 const multiDb = await createMultiDb({
-  // Optional: skip connectivity checks at startup (default: true)
-  // validateConnections: false,
-
   // Required: metadata and role providers
   metadataProvider: staticMetadata({
     databases: [...],
@@ -823,7 +831,7 @@ For cross-database scenario:
 [planning]    Strategy: MATERIALIZED via ch-analytics
 [planning]      orders → default.orders_replica (materialized)
 [planning]      events → default.events (original)
-[sql-gen]     Dialect: clickhouse
+[sql-generation]  Dialect: clickhouse
 ```
 
 ---
