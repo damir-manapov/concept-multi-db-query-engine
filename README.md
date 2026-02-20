@@ -13,16 +13,6 @@ Build a reusable, metadata-driven query engine that lets applications query data
 
 The package (`@mkven/multi-db`) is built as a standalone, reusable library with zero I/O dependencies in the core.
 
-## Overview
-
-A metadata-driven query planner and executor that abstracts over heterogeneous database backends. Converts a declarative query definition into optimized database requests with:
-
-- Automatic strategy selection (direct, cached, materialized replica, Trino cross-db)
-- Role-based access control (column visibility + column masking per role)
-- Name mapping between API-facing names and physical database names
-- Structured debug logging for full pipeline transparency
-- Support for SQL-only or SQL+execution modes
-
 ## Target Databases
 
 | Engine | Role |
@@ -232,6 +222,17 @@ interface MultiDbConfig {
 
 Metadata source is **abstracted** — hardcoded for now, in future loaded from a database or external service and cached.
 
+### Module Return Type
+
+```ts
+interface MultiDb {
+  query<T = unknown>(input: {
+    definition: QueryDefinition
+    context: ExecutionContext
+  }): Promise<QueryResult<T>>
+}
+```
+
 ---
 
 ## Module Initialization & Query API
@@ -246,6 +247,7 @@ import { createPostgresExecutor } from '@mkven/multi-db-executor-postgres'
 import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
 import { createRedisCache } from '@mkven/multi-db-cache-redis'
 
+// Returns MultiDb instance
 const multiDb = createMultiDb({
   // Required: metadata configuration
   config: {
@@ -352,11 +354,12 @@ interface QueryDefinition {
   joins?: QueryJoin[]
   groupBy?: string[]                  // apiNames to group by
   aggregations?: QueryAggregation[]   // aggregate functions
+  having?: QueryFilter[]              // filters on aggregated values (applied after GROUP BY)
   limit?: number
   offset?: number
-  orderBy?: { column: string; direction: 'asc' | 'desc' }[]
+  orderBy?: QueryOrderBy[]
   freshness?: 'realtime' | 'seconds' | 'minutes' | 'hours'  // acceptable lag
-  byIds?: (string | number)[]        // shortcut: fetch by primary key(s)
+  byIds?: (string | number)[]        // shortcut: fetch by single-column primary key(s)
   executeMode?: 'sql-only' | 'execute' | 'count'  // default: 'execute'
   debug?: boolean                     // include debugLog in result (default: false)
 }
@@ -367,8 +370,14 @@ interface QueryAggregation {
   alias: string                       // result column name
 }
 
+interface QueryOrderBy {
+  column: string                      // apiName
+  direction: 'asc' | 'desc'
+}
+
 interface QueryJoin {
   table: string                       // related table apiName
+  type?: 'inner' | 'left'            // default: 'left' (safe for nullable FKs)
   columns?: string[]                  // columns to select from joined table
   filters?: QueryFilter[]            // filters on joined table
 }
@@ -455,7 +464,7 @@ interface DebugLogEntry {
 }
 ```
 
-When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count. All include metadata. Debug log is included only when `debug: true`.
+When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, and `offset` are ignored. All modes include metadata. Debug log is included only when `debug: true`.
 
 ---
 
@@ -464,9 +473,10 @@ When you request execution (`executeMode = 'execute'`), you get data back — no
 Given a query touching tables T1, T2, ... Tn:
 
 ### Priority 0 — Cache (redis)
-- Only for `byIds` queries
+- Only for `byIds` queries **without `filters`** (filters skip cache — too ambiguous to post-filter)
+- Only for tables with single-column primary keys (composite PKs use filters instead)
 - Check if the table has a cache config
-- If cache hit for all IDs → return from cache (trim columns if needed)
+- If cache hit for all IDs → return from cache (trim columns if needed, apply masking identically to DB results)
 - If partial hit → return cached + fetch missing from DB, merge
 
 ### Priority 1 — Single Database Direct
@@ -616,7 +626,7 @@ interface JoinClause {
 
 interface WhereCondition {
   column: ColumnRef
-  operator: string                    // '='
+  operator: string                    // '=', 'ILIKE', 'ANY', etc. — string (not union) because dialects may emit operators beyond the public QueryFilter set
   paramIndex?: number                 // for parameterized values
   literal?: string                    // for IS NULL, IS NOT NULL
 }
@@ -644,8 +654,8 @@ No external SQL generation packages are used — the query shape is predictable 
 [validation]  Column 'id' → valid (type: uuid)
 [validation]  Column 'total' → valid (type: decimal)
 [validation]  Column 'internalNote' → DENIED for role 'tenant-user' (not in allowedColumns)
-[access]      Trimming columns to allowed set: [id, total, status, createdAt]
-[access]      Masking column 'customerEmail' for roles [tenant-user]
+[access-control] Trimming columns to allowed set: [id, total, status, createdAt]
+[access-control] Masking column 'customerEmail' for roles [tenant-user]
 [planning]    Tables needed: [orders(pg-main), customers(pg-main)]
 [planning]    All tables in 'pg-main' → strategy: DIRECT
 [name-res]    orders.total → public.orders.total_amount
@@ -761,6 +771,7 @@ const ordersColumns: ColumnMeta[] = [
   { apiName: 'id',           physicalName: 'id',              type: 'uuid',      nullable: false },
   { apiName: 'tenantId',     physicalName: 'tenant_id',       type: 'uuid',      nullable: false },
   { apiName: 'customerId',   physicalName: 'customer_id',     type: 'uuid',      nullable: false },
+  { apiName: 'productId',    physicalName: 'product_id',      type: 'uuid',      nullable: true },
   { apiName: 'regionId',     physicalName: 'region_id',       type: 'string',    nullable: false },
   { apiName: 'total',        physicalName: 'total_amount',    type: 'decimal',   nullable: false, maskingFn: 'number' },
   { apiName: 'status',       physicalName: 'order_status',    type: 'string',    nullable: false },
@@ -819,11 +830,51 @@ const tenantsColumns: ColumnMeta[] = [
 ]
 ```
 
+### Sample Column Definitions (invoices table)
+
+```ts
+const invoicesColumns: ColumnMeta[] = [
+  { apiName: 'id',        physicalName: 'id',          type: 'uuid',      nullable: false },
+  { apiName: 'tenantId',  physicalName: 'tenant_id',   type: 'uuid',      nullable: false },
+  { apiName: 'amount',    physicalName: 'amount',      type: 'decimal',   nullable: false, maskingFn: 'number' },
+  { apiName: 'status',    physicalName: 'status',      type: 'string',    nullable: false },
+  { apiName: 'issuedAt',  physicalName: 'issued_at',   type: 'timestamp', nullable: false },
+  { apiName: 'paidAt',    physicalName: 'paid_at',     type: 'timestamp', nullable: true },
+]
+```
+
+### Sample Column Definitions (metrics table — ClickHouse)
+
+```ts
+const metricsColumns: ColumnMeta[] = [
+  { apiName: 'id',        physicalName: 'id',          type: 'uuid',      nullable: false },
+  { apiName: 'name',      physicalName: 'metric_name', type: 'string',    nullable: false },
+  { apiName: 'value',     physicalName: 'value',       type: 'decimal',   nullable: false },
+  { apiName: 'tags',      physicalName: 'tags',        type: 'string',    nullable: true },
+  { apiName: 'timestamp', physicalName: 'ts',          type: 'timestamp', nullable: false },
+]
+```
+
+### Sample Column Definitions (ordersArchive table — Iceberg)
+
+```ts
+const ordersArchiveColumns: ColumnMeta[] = [
+  { apiName: 'id',         physicalName: 'id',           type: 'uuid',      nullable: false },
+  { apiName: 'tenantId',   physicalName: 'tenant_id',    type: 'uuid',      nullable: false },
+  { apiName: 'customerId', physicalName: 'customer_id',  type: 'uuid',      nullable: false },
+  { apiName: 'total',      physicalName: 'total_amount', type: 'decimal',   nullable: false },
+  { apiName: 'status',     physicalName: 'order_status', type: 'string',    nullable: false },
+  { apiName: 'createdAt',  physicalName: 'created_at',   type: 'timestamp', nullable: false },
+  { apiName: 'archivedAt', physicalName: 'archived_at',  type: 'timestamp', nullable: false },
+]
+```
+
 ### Sample Relations
 
 ```ts
 const ordersRelations: RelationMeta[] = [
   { column: 'customerId', references: { table: 'users', column: 'id' }, type: 'many-to-one' },
+  { column: 'productId',  references: { table: 'products', column: 'id' }, type: 'many-to-one' },
   { column: 'tenantId',   references: { table: 'tenants', column: 'id' }, type: 'many-to-one' },
 ]
 
@@ -890,7 +941,7 @@ const roles: RoleMeta[] = [
 | Decision | Choice | Rationale |
 |---|---|---|
 | Package name | `@mkven/multi-db` | Org-scoped, reusable |
-| Language | TypeScript | Matches eng project ecosystem |
+| Language | TypeScript | Type-safe, wide ecosystem |
 | Query format | Typed object literals | Type-safe, IDE support, no parser |
 | Metadata source | Abstracted (hardcoded now, DB/service later) | Flexibility without premature complexity |
 | Execution mode | SQL-only (`SqlResult`) or execution (`DataResult`) | Distinct return types per mode |
