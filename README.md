@@ -126,6 +126,8 @@ interface ColumnMeta {
   physicalName: string                // 'customer_email'
   type: string                        // logical type: 'string', 'int', 'date', 'uuid', 'decimal', 'timestamp', etc.
   nullable: boolean
+  maskingFn?: 'email' | 'phone' | 'name' | 'uuid' | 'number' | 'date' | 'full'
+                                      // how to mask this column when masking is applied by role
 }
 ```
 
@@ -169,28 +171,27 @@ interface CachedTableMeta {
 
 ### Roles & Access Control
 
-Access control is defined **per role**, not per table. Roles are organized into **scopes** (e.g. `user`, `service`). The effective permissions are computed as:
+Access control is defined **per role**, not per table. Roles themselves are scope-agnostic — scoping is determined at query time via `ExecutionContext`. The effective permissions are computed as:
 
-1. **Within a scope** — INTERSECTION (most restrictive). If one role allows all columns and another allows a subset, only the subset is allowed. If roles allow different subsets, only the overlap is allowed.
-2. **Between scopes** — INTERSECTION. The effective permissions are the intersection of all scopes.
+1. **Within a scope** — UNION (most permissive). If one role allows columns A,B and another allows C,D, the effective set is A,B,C,D. This is natural: a user with multiple user-roles accumulates permissions.
+2. **Between scopes** — INTERSECTION (most restrictive). The effective permissions are the intersection of all scope unions.
 
 This ensures that an admin user making a request through a service with restricted access only sees data the service is permitted to handle.
 
 **Example:** Admin user (user scope: all tables, all columns) requests via `orders-service` (service scope: only `orders` + `products` tables). Effective access = only `orders` + `products`.
 
-```ts
-type RoleScope = 'user' | 'service'     // extensible
+**Example 2:** User has roles `viewer` (orders access) + `analyst` (events access) in user scope, and `orders-service` in service scope. User scope union = orders + events. Service scope = orders + products. Intersection = orders only.
 
+```ts
 interface RoleMeta {
-  id: string                          // 'admin', 'manager', 'orders-service'
-  scope: RoleScope                    // which scope this role belongs to
+  id: string                          // 'admin', 'viewer', 'orders-service'
   tables: TableRoleAccess[]
 }
 
 interface TableRoleAccess {
   tableId: string
   allowedColumns: string[] | '*'      // apiNames, or '*' for all
-  maskedColumns?: string[]            // apiNames of columns to mask (e.g. show '***' or partial)
+  maskedColumns?: string[]            // apiNames of columns to mask
 }
 ```
 
@@ -198,18 +199,23 @@ interface TableRoleAccess {
 
 Masking replaces column values in results with obfuscated variants. Masking is a **post-query** operation — data is fetched normally from the database, then masked before returning to the caller.
 
-Masking functions are **predefined** per column type:
+Which masking function to apply is defined on the **column metadata** via the optional `maskingFn` field. The role just declares *which* columns to mask — the column itself knows *how* to be masked.
 
-| Column Type | Masking Function | Example |
+Predefined masking functions:
+
+| maskingFn | Masking Behavior | Example |
 |---|---|---|
 | `email` | Show first char + domain hint | `john@example.com` → `j***@***.com` |
 | `phone` | Show country code + last 3 digits | `+1234567890` → `+1***890` |
-| `string` | Show first + last char | `John Smith` → `J*********h` |
+| `name` | Show first + last char | `John Smith` → `J*********h` |
 | `uuid` | Show first 4 chars | `a1b2c3d4-...` → `a1b2****` |
-| `decimal` / `int` | Replace with `0` | `12345` → `0` |
-| `date` / `timestamp` | Truncate to year | `2025-03-15` → `2025-01-01` |
+| `number` | Replace with `0` | `12345` → `0` |
+| `date` | Truncate to year | `2025-03-15` → `2025-01-01` |
+| `full` | Replace entirely | `anything` → `***` |
 
-The masking function is selected automatically based on the column's `type` in metadata. Masked columns are still returned in results (not hidden), but their values are obfuscated.
+If a column is declared as masked by a role but has no `maskingFn` in metadata, the `full` masking function is applied as a safe default.
+
+Masked columns are still returned in results (not hidden), but their values are obfuscated.
 
 ### Full Configuration
 
@@ -225,6 +231,106 @@ interface MultiDbConfig {
 ```
 
 Metadata source is **abstracted** — hardcoded for now, in future loaded from a database or external service and cached.
+
+---
+
+## Module Initialization & Query API
+
+### Initialization (once at startup)
+
+The module is initialized with the full metadata configuration and optional executor/cache providers:
+
+```ts
+import { createMultiDb } from '@mkven/multi-db'
+import { createPostgresExecutor } from '@mkven/multi-db-executor-postgres'
+import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
+import { createRedisCache } from '@mkven/multi-db-cache-redis'
+
+const multiDb = createMultiDb({
+  // Required: metadata configuration
+  config: {
+    databases: [...],
+    tables: [...],
+    caches: [...],
+    externalSyncs: [...],
+    roles: [...],
+    trino: { enabled: true },
+  },
+
+  // Optional: executors (only needed for executeMode = 'execute' | 'count')
+  executors: {
+    'pg-main': createPostgresExecutor({ connectionString: '...' }),
+    'ch-analytics': createClickHouseExecutor({ url: '...' }),
+  },
+
+  // Optional: cache providers (only needed for cache strategy)
+  cacheProviders: {
+    'redis-main': createRedisCache({ url: '...' }),
+  },
+})
+```
+
+At init time:
+- All apiNames are validated (format, reserved words, uniqueness)
+- Metadata is indexed for fast lookup
+- Database connectivity graph is built (for planner)
+- Configuration errors are thrown immediately
+
+### Query Request (per call)
+
+Each query provides the query definition and the execution context:
+
+```ts
+// Execute and get data
+const result = await multiDb.query({
+  definition: {
+    from: 'orders',
+    columns: ['id', 'total', 'status'],
+    filters: [{ column: 'status', operator: '=', value: 'active' }],
+    limit: 50,
+    offset: 0,
+  },
+  context: {
+    roles: {
+      user: ['admin'],
+      service: ['orders-service'],
+    },
+  },
+})
+
+// Get SQL only (no execution, no executor needed)
+const sqlResult = await multiDb.query({
+  definition: {
+    from: 'orders',
+    columns: ['id', 'total'],
+    executeMode: 'sql-only',
+    debug: true,
+  },
+  context: {
+    roles: { user: ['viewer'] },
+  },
+})
+
+// Count rows
+const countResult = await multiDb.query({
+  definition: {
+    from: 'orders',
+    filters: [{ column: 'status', operator: '=', value: 'active' }],
+    executeMode: 'count',
+  },
+  context: {
+    roles: { user: ['admin'] },
+  },
+})
+```
+
+**What goes where:**
+
+| Provided at init | Provided per query |
+|---|---|
+| Metadata config (databases, tables, roles, syncs, caches) | Query definition (from, columns, filters, joins, etc.) |
+| Executor instances (DB connections) | Execution context (scoped roles) |
+| Cache provider instances | `executeMode`, `debug`, `freshness` |
 
 ---
 
@@ -272,11 +378,14 @@ interface QueryFilter {
 
 ```ts
 interface ExecutionContext {
-  roles: string[]                     // list of RoleMeta.id — scoped resolution applies
+  roles: {                            // scoped role lists
+    user?: string[]                   // user-level roles (union within scope)
+    service?: string[]                // service-level roles (union within scope)
+  }                                   // between scopes: intersection
 }
 ```
 
-Roles from different scopes are intersected. Roles within the same scope are also intersected (most restrictive wins within a scope).
+Roles within a scope are unioned (accumulated permissions). The final effective permissions are the intersection of all scope unions. If a scope is omitted, it imposes no restriction (treated as "all access" for that scope).
 
 ### Query Result
 
@@ -578,15 +687,17 @@ For cross-database scenario:
 
 ### Roles
 
-| Role | Scope | Access |
+| Role | Scope Usage | Access |
 |---|---|---|
 | `admin` | user | All tables, all columns |
-| `tenant-user` | user | orders + customers, subset columns |
-| `regional-manager` | user | orders (all cols) |
+| `tenant-user` | user | orders + users + products, subset columns, email masked |
+| `regional-manager` | user | orders + users + products (all cols, phone+email masked) |
 | `analytics-reader` | user | events + metrics + ordersArchive only |
 | `no-access` | user | No tables (edge case) |
-| `orders-service` | service | orders + products only |
+| `orders-service` | service | orders + products + users (limited cols) |
 | `full-service` | service | All tables, all columns |
+
+Roles have no `scope` field — the same role can be used in any scope via `ExecutionContext`.
 
 ### Test Scenarios
 
@@ -607,9 +718,10 @@ For cross-database scenario:
 | 13 | Admin role | any table | all columns visible |
 | 14 | Tenant-user role | orders | subset columns only |
 | 14b | Column masking | orders (tenant-user) | customerEmail masked |
-| 14c | Multi-role union | orders (tenant-user + regional-manager) | intersection within user scope |
+| 14c | Multi-role within scope | orders (tenant-user + regional-manager) | union within user scope (all order columns) |
 | 14d | Cross-scope restriction | orders (admin user + orders-service) | restricted to orders-service tables |
 | 14e | Count mode | orders (count) | returns count only |
+| 14f | Omitted scope | orders (only user: ['admin'], no service) | no service restriction |
 | 15 | No-access role | any table | denied |
 | 16 | Column trimming on byIds | users byIds + limited columns in role | only intersected columns |
 | 17 | Invalid table name | nonexistent | validation error |
@@ -627,10 +739,142 @@ const ordersColumns: ColumnMeta[] = [
   { apiName: 'tenantId',     physicalName: 'tenant_id',       type: 'uuid',      nullable: false },
   { apiName: 'customerId',   physicalName: 'customer_id',     type: 'uuid',      nullable: false },
   { apiName: 'regionId',     physicalName: 'region_id',       type: 'string',    nullable: false },
-  { apiName: 'total',        physicalName: 'total_amount',    type: 'decimal',   nullable: false },
+  { apiName: 'total',        physicalName: 'total_amount',    type: 'decimal',   nullable: false, maskingFn: 'number' },
   { apiName: 'status',       physicalName: 'order_status',    type: 'string',    nullable: false },
-  { apiName: 'internalNote', physicalName: 'internal_note',   type: 'string',    nullable: true  },
-  { apiName: 'createdAt',    physicalName: 'created_at',      type: 'timestamp', nullable: false },
+  { apiName: 'internalNote', physicalName: 'internal_note',   type: 'string',    nullable: true,  maskingFn: 'full' },
+  { apiName: 'createdAt',    physicalName: 'created_at',      type: 'timestamp', nullable: false, maskingFn: 'date' },
+]
+```
+
+### Sample Column Definitions (users table)
+
+```ts
+const usersColumns: ColumnMeta[] = [
+  { apiName: 'id',        physicalName: 'id',         type: 'uuid',      nullable: false },
+  { apiName: 'email',     physicalName: 'email',      type: 'string',    nullable: false, maskingFn: 'email' },
+  { apiName: 'phone',     physicalName: 'phone',      type: 'string',    nullable: true,  maskingFn: 'phone' },
+  { apiName: 'firstName', physicalName: 'first_name',  type: 'string',    nullable: false, maskingFn: 'name' },
+  { apiName: 'lastName',  physicalName: 'last_name',   type: 'string',    nullable: false, maskingFn: 'name' },
+  { apiName: 'role',      physicalName: 'role',        type: 'string',    nullable: false },
+  { apiName: 'tenantId',  physicalName: 'tenant_id',   type: 'uuid',      nullable: false },
+  { apiName: 'createdAt', physicalName: 'created_at',  type: 'timestamp', nullable: false },
+]
+```
+
+### Sample Column Definitions (products table)
+
+```ts
+const productsColumns: ColumnMeta[] = [
+  { apiName: 'id',        physicalName: 'id',          type: 'uuid',    nullable: false },
+  { apiName: 'name',      physicalName: 'name',        type: 'string',  nullable: false },
+  { apiName: 'category',  physicalName: 'category',    type: 'string',  nullable: false },
+  { apiName: 'price',     physicalName: 'price',       type: 'decimal', nullable: false, maskingFn: 'number' },
+  { apiName: 'tenantId',  physicalName: 'tenant_id',   type: 'uuid',    nullable: false },
+]
+```
+
+### Sample Column Definitions (events table — ClickHouse)
+
+```ts
+const eventsColumns: ColumnMeta[] = [
+  { apiName: 'id',        physicalName: 'id',          type: 'uuid',      nullable: false },
+  { apiName: 'type',      physicalName: 'event_type',  type: 'string',    nullable: false },
+  { apiName: 'userId',    physicalName: 'user_id',     type: 'uuid',      nullable: false },
+  { apiName: 'payload',   physicalName: 'payload',     type: 'string',    nullable: true,  maskingFn: 'full' },
+  { apiName: 'timestamp', physicalName: 'event_ts',    type: 'timestamp', nullable: false },
+]
+```
+
+### Sample Column Definitions (tenants table)
+
+```ts
+const tenantsColumns: ColumnMeta[] = [
+  { apiName: 'id',       physicalName: 'id',        type: 'uuid',   nullable: false },
+  { apiName: 'name',     physicalName: 'name',      type: 'string', nullable: false },
+  { apiName: 'plan',     physicalName: 'plan',      type: 'string', nullable: false },
+  { apiName: 'apiKey',   physicalName: 'api_key',   type: 'string', nullable: false, maskingFn: 'full' },
+]
+```
+
+### Sample Relations
+
+```ts
+const ordersRelations: RelationMeta[] = [
+  { column: 'customerId', references: { table: 'users', column: 'id' }, type: 'many-to-one' },
+  { column: 'tenantId',   references: { table: 'tenants', column: 'id' }, type: 'many-to-one' },
+]
+
+const eventsRelations: RelationMeta[] = [
+  { column: 'userId', references: { table: 'users', column: 'id' }, type: 'many-to-one' },
+]
+```
+
+### Sample Role Configurations
+
+```ts
+const roles: RoleMeta[] = [
+  {
+    id: 'admin',
+    tables: [
+      { tableId: 'users',    allowedColumns: '*' },
+      { tableId: 'orders',   allowedColumns: '*' },
+      { tableId: 'products', allowedColumns: '*' },
+      { tableId: 'tenants',  allowedColumns: '*' },
+      { tableId: 'invoices', allowedColumns: '*' },
+      { tableId: 'events',   allowedColumns: '*' },
+      { tableId: 'metrics',  allowedColumns: '*' },
+      { tableId: 'orders-archive', allowedColumns: '*' },
+    ],
+  },
+  {
+    id: 'tenant-user',
+    tables: [
+      { tableId: 'orders',   allowedColumns: ['id', 'total', 'status', 'createdAt'], maskedColumns: ['total'] },
+      { tableId: 'users',    allowedColumns: ['id', 'firstName', 'lastName', 'email'], maskedColumns: ['email'] },
+      { tableId: 'products', allowedColumns: ['id', 'name', 'category', 'price'] },
+    ],
+  },
+  {
+    id: 'regional-manager',
+    tables: [
+      { tableId: 'orders',   allowedColumns: '*' },
+      { tableId: 'users',    allowedColumns: '*', maskedColumns: ['phone', 'email'] },
+      { tableId: 'products', allowedColumns: '*' },
+    ],
+  },
+  {
+    id: 'analytics-reader',
+    tables: [
+      { tableId: 'events',         allowedColumns: '*', maskedColumns: ['payload'] },
+      { tableId: 'metrics',        allowedColumns: '*' },
+      { tableId: 'orders-archive', allowedColumns: '*' },
+    ],
+  },
+  {
+    id: 'no-access',
+    tables: [],
+  },
+  {
+    id: 'orders-service',
+    tables: [
+      { tableId: 'orders',   allowedColumns: '*' },
+      { tableId: 'products', allowedColumns: '*' },
+      { tableId: 'users',    allowedColumns: ['id', 'firstName', 'lastName'] },
+    ],
+  },
+  {
+    id: 'full-service',
+    tables: [
+      { tableId: 'users',    allowedColumns: '*' },
+      { tableId: 'orders',   allowedColumns: '*' },
+      { tableId: 'products', allowedColumns: '*' },
+      { tableId: 'tenants',  allowedColumns: '*' },
+      { tableId: 'invoices', allowedColumns: '*' },
+      { tableId: 'events',   allowedColumns: '*' },
+      { tableId: 'metrics',  allowedColumns: '*' },
+      { tableId: 'orders-archive', allowedColumns: '*' },
+    ],
+  },
 ]
 ```
 
@@ -646,7 +890,7 @@ const ordersColumns: ColumnMeta[] = [
 | Metadata source | Abstracted (hardcoded now, DB/service later) | Flexibility without premature complexity |
 | Execution mode | SQL-only (`SqlResult`) or execution (`DataResult`) | Distinct return types per mode |
 | Freshness | Prefer original, allow specifying lag tolerance | Correctness by default, performance opt-in |
-| Access control | Scoped roles: intersection between scopes, intersection within scope | Admin user via restricted service = restricted |
+| Access control | Scoped roles: UNION within scope, INTERSECTION between scopes | User accumulates perms, service restricts them |
 | SQL generation | Hand-rolled via `SqlParts` IR (internal, physical names only), no external packages | Full control over 3 divergent dialects, zero deps |
 | Pagination | Offset-based (`limit` + `offset`) | Simple, sufficient for most use cases |
 | Observability | OpenTelemetry | Industry standard, traces + metrics |
@@ -759,3 +1003,4 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 - [ ] How to handle schema drift between original and replicated tables
 - [ ] RLS (row-level security) — deferred, may add later
 - [ ] Cursor-based pagination as alternative to offset?
+- [ ] Custom masking functions beyond predefined set?
