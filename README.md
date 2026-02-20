@@ -575,9 +575,11 @@ interface DebugLogEntry {
 }
 ```
 
-When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, `offset`, and `distinct` are ignored (always emits `COUNT(*)`, never `COUNT(DISTINCT ...)`). All modes include metadata. Debug log is included only when `debug: true`.
+When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, `offset`, `distinct`, `groupBy`, and `aggregations` are ignored (always emits `SELECT COUNT(*) FROM ...`, never grouped counts). All modes include metadata. Debug log is included only when `debug: true`.
 
 In `sql-only` mode, masking cannot be applied (no data to mask). However, `meta.columns[].masked` still reports masking intent so the caller can apply masking themselves after execution.
+
+**Masking and aggregations:** aggregation aliases are never masked. Masking applies to raw column values, not aggregated results. If `total` has `maskingFn: 'number'` and you query `SUM(total) as totalSum`, `totalSum` is returned unmasked — the aggregate collapses rows, so row-level masking is not meaningful.
 
 ---
 
@@ -627,7 +629,7 @@ Given a query touching tables T1, T2, ... Tn:
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`
-9. **Order By validity** — `orderBy` must reference columns from `from` table or joined tables
+9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided
 12. **Exists filter validity** — `QueryExistsFilter.table` must have a defined relation to the `from` table (or a joining table); role must allow access to the related table
@@ -809,6 +811,10 @@ interface TableRef {
   catalog?: string                    // for trino: 'pg_main'
 }
 
+// QueryJoin.filters are placed in WHERE, not ON. The ON clause only contains the join condition
+// (leftColumn = rightColumn). For LEFT JOINs this means join-scoped filters effectively convert
+// to INNER JOIN semantics — rows where the joined table doesn't match the filter are excluded.
+// This is intentional: if you filter on a joined table, you want matching rows only.
 interface JoinClause {
   type: 'inner' | 'left'
   table: TableRef
@@ -1013,6 +1019,10 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 71 | Mixed top-level filters | orders WHERE status='active' AND (total > 50 OR total < 10) AND EXISTS invoices(status='paid') | filter + group + exists combined |
 | 72 | Multiple HAVING conditions | orders GROUP BY status HAVING SUM(total) > 100 AND COUNT(*) > 5 | two aggregate conditions |
 | 73 | HAVING with OR group | orders GROUP BY status HAVING (SUM(total) > 1000 OR AVG(total) > 200) | OR in HAVING |
+| 74 | `like` filter | orders WHERE status LIKE 'act%' | correct case-sensitive LIKE per dialect |
+| 75 | `not_like` filter | orders WHERE status NOT LIKE '%cancel%' | correct NOT LIKE per dialect |
+| 76 | Count + groupBy ignored | orders GROUP BY status, SUM(total) (count mode) | groupBy/aggregations ignored, returns scalar count |
+| 77 | Order by aggregation alias | orders GROUP BY status, SUM(total) as totalSum, ORDER BY totalSum | correct ORDER BY alias per dialect |
 
 ### Test Scenarios by Package
 
@@ -1110,6 +1120,9 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 71 | Mixed top-level filters | filter + group + exists combined |
 | 72 | Multiple HAVING conditions | two aggregate HAVING conditions |
 | 73 | HAVING with OR group | OR inside HAVING |
+| 74 | `like` filter | case-sensitive LIKE |
+| 75 | `not_like` filter | NOT LIKE |
+| 77 | Order by aggregation alias | ORDER BY aggregate alias |
 
 #### `tests/cache/` — cache strategy + masking on cached data
 
@@ -1130,6 +1143,7 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 60 | Health check | healthCheck() per-provider status |
 | 61 | Hot-reload metadata | reloadMetadata() + query with new table |
 | 62 | Reload failure | reloadRoles() fails, old config preserved |
+| 76 | Count + groupBy ignored | count mode ignores groupBy/aggregations |
 
 ### Sample Column Definitions (orders table)
 
