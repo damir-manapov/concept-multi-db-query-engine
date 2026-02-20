@@ -987,10 +987,31 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 46 | Invalid filter operator | orders WHERE id > 'some-uuid' (uuid type) | validation error: INVALID_FILTER |
 | 47 | Access denied on column | orders columns: [internalNote] (tenant-user) | validation error: ACCESS_DENIED |
 | 48 | Cache provider missing | users byIds=[1] (no redis provider registered) | ExecutionError: CACHE_PROVIDER_MISSING |
+| 49 | Invalid apiName format | table apiName 'Order_Items' (has underscore) | ConfigError: INVALID_API_NAME |
+| 50 | Duplicate apiName | two tables with apiName 'orders' | ConfigError: DUPLICATE_API_NAME |
+| 51 | Invalid DB reference | table references non-existent database 'pg-other' | ConfigError: INVALID_REFERENCE |
+| 52 | Invalid relation | relation references non-existent table 'invoiceLines' | ConfigError: INVALID_RELATION |
+| 53 | Connection failed | executor ping fails at init | ConnectionError: CONNECTION_FAILED |
+| 54 | Metadata provider fails | MetadataProvider.load() throws | ProviderError: METADATA_LOAD_FAILED |
+| 55 | Role provider fails | RoleProvider.load() throws | ProviderError: ROLE_LOAD_FAILED |
+| 56 | No Trino catalog | trino enabled, database missing trinoCatalog | PlannerError: NO_CATALOG |
+| 57 | Freshness unmet | realtime required, all paths have lag, no trino catalog | PlannerError: FRESHNESS_UNMET |
 
 ### Test Scenarios by Package
 
 Each scenario maps to the test directory that owns it. Some scenarios touch multiple phases but are assigned to their **primary concern**.
+
+#### `tests/init/` — init-time errors (ConfigError, ConnectionError, ProviderError)
+
+| # | Scenario | Error |
+|---|---|---|
+| 49 | Invalid apiName format | ConfigError: INVALID_API_NAME |
+| 50 | Duplicate apiName | ConfigError: DUPLICATE_API_NAME |
+| 51 | Invalid DB reference | ConfigError: INVALID_REFERENCE |
+| 52 | Invalid relation | ConfigError: INVALID_RELATION |
+| 53 | Connection failed | ConnectionError: CONNECTION_FAILED |
+| 54 | Metadata provider fails | ProviderError: METADATA_LOAD_FAILED |
+| 55 | Role provider fails | ProviderError: ROLE_LOAD_FAILED |
 
 #### `tests/validation/` — input validation against metadata + roles
 
@@ -1041,6 +1062,8 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 12 | Freshness=hours | P2 — materialized |
 | 19 | Trino disabled | P4 — error |
 | 33 | byIds + filters (cache skip) | P0 skipped → P1 |
+| 56 | No Trino catalog | P4 — NO_CATALOG |
+| 57 | Freshness unmet | P4 — FRESHNESS_UNMET |
 
 #### `tests/generator/` — SQL generation per dialect
 
@@ -1380,6 +1403,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 └── tests/
     ├── fixtures/
     │   └── testConfig.ts            # the full test config described above
+    ├── init/
     ├── validation/
     ├── access/
     ├── planner/
