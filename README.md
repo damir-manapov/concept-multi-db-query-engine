@@ -496,15 +496,15 @@ interface QueryFilter {
   column: string                      // apiName (or aggregation alias when used in `having`)
   table?: string                      // apiName of table; omit for `from` table. Allows filtering on joined table columns at top level
                                       // Exception: inside QueryJoin.filters, omitting `table` resolves against the joined table (not `from`)
-  operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not_in' | 'like' | 'not_like' | 'ilike' | 'not_ilike'
-           | 'is_null' | 'is_not_null' | 'between' | 'not_between'
-           | 'contains' | 'icontains' | 'not_contains' | 'not_icontains'
-           | 'starts_with' | 'istarts_with' | 'ends_with' | 'iends_with'
-           | 'levenshtein_lte'
-  value?: unknown                     // scalar for most operators; array for 'in'/'not_in'; omit for 'is_null'/'is_not_null'
-                                      // for 'between'/'not_between': { from: unknown, to: unknown } (inclusive range)
-                                      // for 'levenshtein_lte': { text: string, maxDistance: number }
-                                      // for 'contains'/'icontains'/'not_contains'/'not_icontains'/'starts_with'/'istarts_with'/'ends_with'/'iends_with': plain string (no wildcards — added internally)
+  operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'notIn' | 'like' | 'notLike' | 'ilike' | 'notIlike'
+           | 'isNull' | 'isNotNull' | 'between' | 'notBetween'
+           | 'contains' | 'icontains' | 'notContains' | 'notIcontains'
+           | 'startsWith' | 'istartsWith' | 'endsWith' | 'iendsWith'
+           | 'levenshteinLte'
+  value?: unknown                     // scalar for most operators; array for 'in'/'notIn'; omit for 'isNull'/'isNotNull'
+                                      // for 'between'/'notBetween': { from: unknown, to: unknown } (inclusive range)
+                                      // for 'levenshteinLte': { text: string, maxDistance: number }
+                                      // for 'contains'/'icontains'/'notContains'/'notIcontains'/'startsWith'/'istartsWith'/'endsWith'/'iendsWith': plain string (no wildcards — added internally)
 }
 
 // Column-vs-column comparison — right side is another column, not a literal value
@@ -671,10 +671,10 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; malformed compound values (`between`/`not_between` missing `to`, `levenshtein_lte` with non-integer or negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `in`/`not_in` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`not_in` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); `isNull`/`isNotNull` additionally require `nullable: true`; malformed compound values (`between`/`notBetween` missing `to`, `levenshteinLte` with non-integer or negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `in`/`notIn` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`notIn` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database. When `QueryGroupBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
-8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL); only comparison, range, and null-check operators are allowed — `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `not_in`, `between`, `not_between`, `is_null`, `is_not_null`; pattern operators (`like`, `ilike`, `contains`, `starts_with`, `ends_with`, and their `not_`/`i` variants) and `levenshtein_lte` are rejected — they operate on text values, not aggregated numbers
+8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL); only comparison, range, and null-check operators are allowed — `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `notIn`, `between`, `notBetween`, `isNull`, `isNotNull`; pattern operators (`like`, `ilike`, `contains`, `startsWith`, `endsWith`, and their `not`/`i` variants) and `levenshteinLte` are rejected — they operate on text values, not aggregated numbers
 9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`. When `QueryOrderBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`; `byIds` + `joins` is valid — cache (P0) is skipped (cache stores single-table data) but direct DB (P1+) handles it normally (`WHERE pk = ANY($1)` with JOINs)
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided; `offset` requires `limit` (offset without limit is rejected)
@@ -691,23 +691,23 @@ All validation errors are **collected, not thrown one at a time**. The system ru
 | `=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `!=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `>` `<` `>=` `<=` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
-| `in` `not_in` | ✓ | ✓ | ✓ | — | ✓ | — | — |
-| `like` `not_like` | ✓ | — | — | — | — | — | — |
-| `ilike` `not_ilike` | ✓ | — | — | — | — | — | — |
+| `in` `notIn` | ✓ | ✓ | ✓ | — | ✓ | — | — |
+| `like` `notLike` | ✓ | — | — | — | — | — | — |
+| `ilike` `notIlike` | ✓ | — | — | — | — | — | — |
 | `between` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
-| `not_between` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
+| `notBetween` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
 | `contains` `icontains` | ✓ | — | — | — | — | — | — |
-| `not_contains` `not_icontains` | ✓ | — | — | — | — | — | — |
-| `starts_with` `istarts_with` | ✓ | — | — | — | — | — | — |
-| `ends_with` `iends_with` | ✓ | — | — | — | — | — | — |
-| `is_null` `is_not_null` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
-| `levenshtein_lte` | ✓ | — | — | — | — | — | — |
+| `notContains` `notIcontains` | ✓ | — | — | — | — | — | — |
+| `startsWith` `istartsWith` | ✓ | — | — | — | — | — | — |
+| `endsWith` `iendsWith` | ✓ | — | — | — | — | — | — |
+| `isNull` `isNotNull` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
+| `levenshteinLte` | ✓ | — | — | — | — | — | — |
 
 `QueryColumnFilter` is not listed — it supports `=`, `!=`, `>`, `<`, `>=`, `<=` with the same type restrictions as those operators. Both columns must have compatible types.
 
-\* `is_null` / `is_not_null` are valid on any type but only on columns with `nullable: true`.
+\* `isNull` / `isNotNull` are valid on any type but only on columns with `nullable: true`.
 
-Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`not_in` are rejected on `date`/`timestamp` — use range comparisons instead. `between`/`not_between` follow the same type rules as `>=`/`<=` (orderable types only — excludes `uuid` and `boolean`); `not_between` emits `NOT (col BETWEEN $1 AND $2)`. `like`/`ilike`/`contains`/`icontains`/`not_contains`/`not_icontains`/`starts_with`/`istarts_with`/`ends_with`/`iends_with` are string-only. `contains`/`icontains` map to `LIKE '%x%'` / `ILIKE '%x%'`; `not_contains`/`not_icontains` map to `NOT LIKE '%x%'` / `NOT ILIKE '%x%'` — wildcard characters in the value are escaped automatically. `starts_with`/`istarts_with` map to `LIKE 'x%'` / `ILIKE 'x%'`; `ends_with`/`iends_with` map to `LIKE '%x'` / `ILIKE '%x'`. `levenshtein_lte` is string-only — it matches rows where the Levenshtein edit distance between the column value and the target text is ≤ `maxDistance`. No index support in any dialect — always a full scan. PostgreSQL requires the `fuzzystrmatch` extension (`CREATE EXTENSION fuzzystrmatch`).
+Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`notIn` are rejected on `date`/`timestamp` — use range comparisons instead. `between`/`notBetween` follow the same type rules as `>=`/`<=` (orderable types only — excludes `uuid` and `boolean`); `notBetween` emits `NOT (col BETWEEN $1 AND $2)`. `like`/`ilike`/`contains`/`icontains`/`notContains`/`notIcontains`/`startsWith`/`istartsWith`/`endsWith`/`iendsWith` are string-only. `contains`/`icontains` map to `LIKE '%x%'` / `ILIKE '%x%'`; `notContains`/`notIcontains` map to `NOT LIKE '%x%'` / `NOT ILIKE '%x%'` — wildcard characters in the value are escaped automatically. `startsWith`/`istartsWith` map to `LIKE 'x%'` / `ILIKE 'x%'`; `endsWith`/`iendsWith` map to `LIKE '%x'` / `ILIKE '%x'`. `levenshteinLte` is string-only — it matches rows where the Levenshtein edit distance between the column value and the target text is ≤ `maxDistance`. No index support in any dialect — always a full scan. PostgreSQL requires the `fuzzystrmatch` extension (`CREATE EXTENSION fuzzystrmatch`).
 
 `QueryFilter.table` allows filtering on joined table columns directly in the top-level `filters[]` array, as an alternative to placing filters in `QueryJoin.filters`. Both approaches produce the same SQL (filter goes in WHERE, not ON). When `table` is omitted, the column is resolved against the `from` table. If the `from` table and a joined table share an apiName, the unqualified name resolves to the `from` table — use `table` to disambiguate.
 
@@ -800,7 +800,7 @@ The top-level `Error.message` for multi-error types summarizes the count: e.g. `
 
 `MultiDbError.toJSON()` returns a plain object safe for `JSON.stringify()`, structured loggers, and HTTP error responses. It recursively serializes `cause` (if present) and `errors[]` arrays, so all diagnostic data survives transport. Standard `Error` objects lose all custom fields during `JSON.stringify()` — `toJSON()` ensures `code`, `details`, `message`, and `cause` are always included.
 
-`ConfigError` is thrown at init time and during `reloadMetadata()` — it collects **all** config issues (invalid apiNames, duplicate names, broken references, broken relations, broken sync references, invalid cache configs) into a single error with an `errors[]` array, same philosophy as `ValidationError`. Each error's `details` includes `database` / `cacheId` when relevant, so the caller knows exactly which database or cache config is broken. `ConnectionError` is thrown at init time when executor/cache pings fail — conceptually distinct from config validation (config is correct, infrastructure is unreachable). Each unreachable entry carries `engine` (postgres/clickhouse/trino/redis) and `cause?: Error` to preserve the original ping failure (stack trace, message). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. It carries `fromTable` to correlate the error to the specific query. Individual errors include `filterIndex` (zero-based) to identify which filter caused the issue, and `refColumn` / `refTable` for `QueryColumnFilter` errors. `INVALID_VALUE` is used for structurally malformed compound values (missing `to` in `between`, negative `maxDistance` in `levenshtein_lte`, empty array in `in`) — distinct from `INVALID_FILTER` which covers type/operator mismatches. `PlannerError` is thrown when no execution strategy can satisfy the query — `details` is a discriminated union keyed by `code`, so each variant carries only its relevant fields. It also carries `fromTable` to correlate to the query. `ExecutionError` is thrown during SQL execution or cache access — `details` is a discriminated union keyed by `code` (`QUERY_FAILED` includes `sql` + `params` + `dialect` + `cause`, `QUERY_TIMEOUT` includes `sql` + `timeoutMs` + `dialect`, `EXECUTOR_MISSING` includes `database`, `CACHE_PROVIDER_MISSING` includes `cacheId`). The `dialect` field in `QUERY_FAILED` and `QUERY_TIMEOUT` tells the caller which engine failed — essential when debugging Trino cross-catalog queries vs direct Postgres/ClickHouse. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails — at init time or during `reloadMetadata()` / `reloadRoles()`. Both `ExecutionError` and `ProviderError` use ES2022 `Error.cause` to chain the original error instead of a custom field.
+`ConfigError` is thrown at init time and during `reloadMetadata()` — it collects **all** config issues (invalid apiNames, duplicate names, broken references, broken relations, broken sync references, invalid cache configs) into a single error with an `errors[]` array, same philosophy as `ValidationError`. Each error's `details` includes `database` / `cacheId` when relevant, so the caller knows exactly which database or cache config is broken. `ConnectionError` is thrown at init time when executor/cache pings fail — conceptually distinct from config validation (config is correct, infrastructure is unreachable). Each unreachable entry carries `engine` (postgres/clickhouse/trino/redis) and `cause?: Error` to preserve the original ping failure (stack trace, message). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. It carries `fromTable` to correlate the error to the specific query. Individual errors include `filterIndex` (zero-based) to identify which filter caused the issue, and `refColumn` / `refTable` for `QueryColumnFilter` errors. `INVALID_VALUE` is used for structurally malformed compound values (missing `to` in `between`, negative `maxDistance` in `levenshteinLte`, empty array in `in`) — distinct from `INVALID_FILTER` which covers type/operator mismatches. `PlannerError` is thrown when no execution strategy can satisfy the query — `details` is a discriminated union keyed by `code`, so each variant carries only its relevant fields. It also carries `fromTable` to correlate to the query. `ExecutionError` is thrown during SQL execution or cache access — `details` is a discriminated union keyed by `code` (`QUERY_FAILED` includes `sql` + `params` + `dialect` + `cause`, `QUERY_TIMEOUT` includes `sql` + `timeoutMs` + `dialect`, `EXECUTOR_MISSING` includes `database`, `CACHE_PROVIDER_MISSING` includes `cacheId`). The `dialect` field in `QUERY_FAILED` and `QUERY_TIMEOUT` tells the caller which engine failed — essential when debugging Trino cross-catalog queries vs direct Postgres/ClickHouse. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails — at init time or during `reloadMetadata()` / `reloadRoles()`. Both `ExecutionError` and `ProviderError` use ES2022 `Error.cause` to chain the original error instead of a custom field.
 
 ---
 
@@ -843,12 +843,12 @@ This decouples the API contract from database schema evolution.
 | Identifier quoting | `"column"` | `` `column` `` | `"column"` |
 | Parameter binding | `$1, $2` | `{p1:Type}` | `?` |
 | `in` | `= ANY($1::type[])` | `IN tuple(v1, v2, ...)` | `IN (?, ?, ...)` (param expansion) |
-| `not_in` | `<> ALL($1::type[])` | `NOT IN tuple(v1, v2, ...)` | `NOT IN (?, ?, ...)` (param expansion) |
+| `notIn` | `<> ALL($1::type[])` | `NOT IN tuple(v1, v2, ...)` | `NOT IN (?, ?, ...)` (param expansion) |
 | Date functions | `date_trunc(...)` | `toStartOfDay(...)` | `date_trunc(...)` |
 | LIMIT/OFFSET | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` |
 | Case-insensitive LIKE | `ILIKE` | `ilike(col, pattern)` | `lower(col) LIKE lower(pattern)` |
-| `starts_with` / `ends_with` | `LIKE 'x%'` / `LIKE '%x'` | `startsWith(col, {p1})` / `endsWith(col, {p2})` | `LIKE 'x%'` / `LIKE '%x'` |
-| `istarts_with` / `iends_with` | `ILIKE 'x%'` / `ILIKE '%x'` | `ilike(col, 'x%')` / `ilike(col, '%x')` | `lower(col) LIKE lower('x%')` / `lower(col) LIKE lower('%x')` |
+| `startsWith` / `endsWith` | `LIKE 'x%'` / `LIKE '%x'` | `startsWith(col, {p1})` / `endsWith(col, {p2})` | `LIKE 'x%'` / `LIKE '%x'` |
+| `istartsWith` / `iendsWith` | `ILIKE 'x%'` / `ILIKE '%x'` | `ilike(col, 'x%')` / `ilike(col, '%x')` | `lower(col) LIKE lower('x%')` / `lower(col) LIKE lower('%x')` |
 | Levenshtein distance | `levenshtein(col, $1) <= $2` | `editDistance(col, {p1:String}) <= {p2:UInt32}` | `levenshtein_distance(col, ?) <= ?` |
 | BETWEEN | `col BETWEEN $1 AND $2` | `col BETWEEN {p1} AND {p2}` | `col BETWEEN ? AND ?` |
 | NOT BETWEEN | `col NOT BETWEEN $1 AND $2` | `NOT (col BETWEEN {p1} AND {p2})` | `col NOT BETWEEN ? AND ?` |
@@ -912,7 +912,7 @@ interface SqlParts {
 // Recursive WHERE tree — mirrors QueryFilterGroup at the physical level
 type WhereNode = WhereCondition | WhereColumnCondition | WhereBetween | WhereFunction | WhereGroup | WhereExists | WhereCountedSubquery
 
-// Function-based condition — for operators that wrap the column in a function (e.g. levenshtein_lte)
+// Function-based condition — for operators that wrap the column in a function (e.g. levenshteinLte)
 interface WhereFunction {
   fn: string                          // dialect resolves to actual function name (e.g. 'levenshtein', 'editDistance', 'levenshtein_distance')
   column: ColumnRef
@@ -1003,10 +1003,10 @@ interface WhereColumnCondition {
   rightColumn: ColumnRef
 }
 
-// Range condition — for 'between' / 'not_between' operators
+// Range condition — for 'between' / 'notBetween' operators
 interface WhereBetween {
   column: ColumnRef
-  not?: boolean                       // when true, emits NOT (col BETWEEN ... AND ...) — used by 'not_between' operator
+  not?: boolean                       // when true, emits NOT (col BETWEEN ... AND ...) — used by 'notBetween' operator
   fromParamIndex: number              // param index for lower bound
   toParamIndex: number                // param index for upper bound
 }
@@ -1165,28 +1165,28 @@ Tests are split between packages. Validation package tests run without DB connec
 | 88 | Alias collides with column apiName | orders columns: [status], SUM(total) as status | rule 14 — INVALID_AGGREGATION |
 | 97 | Offset without limit | orders offset: 10 (no limit) | rule 11 — INVALID_LIMIT |
 | 98 | Filter on joined non-existent column | orders JOIN products, filter: products.nonexistent = 'x' | rule 2 — UNKNOWN_COLUMN |
-| 107 | `is_null` on non-nullable | orders WHERE id IS NULL (id: nullable=false) | rule 5 — INVALID_FILTER |
-| 109 | `levenshtein_lte` on non-string | orders WHERE total levenshtein_lte { text: '100', maxDistance: 1 } | rule 5 — INVALID_FILTER (decimal column) |
+| 107 | `isNull` on non-nullable | orders WHERE id IS NULL (id: nullable=false) | rule 5 — INVALID_FILTER |
+| 109 | `levenshteinLte` on non-string | orders WHERE total levenshteinLte { text: '100', maxDistance: 1 } | rule 5 — INVALID_FILTER (decimal column) |
 | 116 | `between` on boolean | orders WHERE status between { from: true, to: false } | rule 5 — INVALID_FILTER (boolean not orderable) |
 | 117 | `contains` on non-string | orders WHERE total contains '100' | rule 5 — INVALID_FILTER (decimal column) |
 | 118 | Column filter type mismatch | orders WHERE total(decimal) > status(string) | rule 5 — INVALID_FILTER (incompatible types) |
 | 119 | Column filter on denied column | orders WHERE internalNote > status (tenant-user) | rule 4 — ACCESS_DENIED (column in filter) |
 | 120 | `between` malformed value | orders WHERE total between { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value) |
-| 121 | `levenshtein_lte` negative maxDistance | users WHERE lastName levenshtein_lte { text: 'x', maxDistance: -1 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
+| 121 | `levenshteinLte` negative maxDistance | users WHERE lastName levenshteinLte { text: 'x', maxDistance: -1 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
 | 122 | `in` with empty array | orders WHERE status in [] | rule 5 — INVALID_VALUE (empty array produces invalid SQL) |
 | 123 | Column filter non-existent refColumn | orders WHERE total > nonexistent (QueryColumnFilter) | rule 2 — UNKNOWN_COLUMN (refColumn side) |
 | 139 | Filter with `table` referencing non-joined table | users query, filter `{ column: 'status', table: 'orders', operator: '=' }` without joining orders | rule 5 — table 'orders' is not `from` and not in `joins` |
 | 140 | `in` with mismatched element types | orders WHERE status IN (1, 2) but status is 'string' | rule 5 — INVALID_VALUE: array elements must match column type |
 | 141 | `table` in having filter rejected | orders GROUP BY status, HAVING { column: 'totalSum', table: 'orders' } | rule 8 — `table` not allowed in `having` filters |
 | 143 | byIds with composite PK | orders byIds=[1,2] but table has composite PK [tenantId, id] | rule 10 — byIds requires single-column primary key |
-| 145 | `not_between` malformed value | orders WHERE total not_between { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value, same as between) |
-| 146 | `not_in` on date column | orders WHERE createdAt not_in ['2024-01-01'] | rule 5 — `not_in` rejected on `timestamp` type |
-| 150 | `in` with null element | orders WHERE status IN ('active', null) | rule 5 — INVALID_VALUE: null in `in`/`not_in` array rejected (NOT IN + NULL = 0 rows) |
+| 145 | `notBetween` malformed value | orders WHERE total notBetween { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value, same as between) |
+| 146 | `notIn` on date column | orders WHERE createdAt notIn ['2024-01-01'] | rule 5 — `notIn` rejected on `timestamp` type |
+| 150 | `in` with null element | orders WHERE status IN ('active', null) | rule 5 — INVALID_VALUE: null in `in`/`notIn` array rejected (NOT IN + NULL = 0 rows) |
 | 151 | QueryColumnFilter in HAVING group | orders GROUP BY status, HAVING group with QueryColumnFilter { column: 'totalSum', refColumn: 'avgTotal' } | rule 8 — HAVING rejects `QueryColumnFilter` (aliases, not table columns) |
 | 153 | `contains` operator in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'contains', value: '100' } | rule 8 — INVALID_HAVING: pattern operators rejected in HAVING |
-| 154 | `levenshtein_lte` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'levenshtein_lte', value: { text: '100', maxDistance: 1 } } | rule 8 — INVALID_HAVING: function operators rejected in HAVING |
+| 154 | `levenshteinLte` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'levenshteinLte', value: { text: '100', maxDistance: 1 } } | rule 8 — INVALID_HAVING: function operators rejected in HAVING |
 | 165 | Nested EXISTS | orders EXISTS(invoices WHERE EXISTS(users WHERE role='admin')) | rule 12 — inner EXISTS resolves `users` relation against `invoices` (outer EXISTS table), not `orders` |
-| 167 | `levenshtein_lte` fractional maxDistance | users WHERE lastName levenshtein_lte { text: 'x', maxDistance: 1.5 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
+| 167 | `levenshteinLte` fractional maxDistance | users WHERE lastName levenshteinLte { text: 'x', maxDistance: 1.5 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1259,17 +1259,17 @@ Tests are split between packages. Validation package tests run without DB connec
 | 28 | OR filter group | orders WHERE (status='active' OR total > 100) | OR clause |
 | 29 | Negated filter group | orders WHERE NOT (status='cancelled' AND total = 0) | NOT (...) |
 | 30 | ILIKE filter | users WHERE email ILIKE '%@example%' | dialect-specific ILIKE |
-| 45 | is_null filter | orders WHERE productId IS NULL | IS NULL |
+| 45 | isNull filter | orders WHERE productId IS NULL | IS NULL |
 | 66 | `in` filter | orders WHERE status IN ('active','shipped') | IN array param binding |
-| 67 | `not_in` filter | orders WHERE status NOT IN ('cancelled') | NOT IN |
-| 68 | `is_not_null` filter | orders WHERE productId IS NOT NULL | IS NOT NULL |
+| 67 | `notIn` filter | orders WHERE status NOT IN ('cancelled') | NOT IN |
+| 68 | `isNotNull` filter | orders WHERE productId IS NOT NULL | IS NOT NULL |
 | 69 | Join-scoped filter | orders JOIN products, products.category = 'electronics' | filter on QueryJoin.filters |
 | 70 | Deeply nested WHERE | orders WHERE (status='active' OR (total > 100 AND ...)) | 3-level nested AND/OR |
 | 71 | Mixed top-level filters | orders WHERE status + group + exists combined | filter + group + exists |
 | 72 | Multiple HAVING conditions | orders GROUP BY status HAVING SUM > 100 AND COUNT > 5 | two aggregate HAVING conditions |
 | 73 | HAVING with OR group | orders HAVING (SUM(total) > 1000 OR AVG(total) > 200) | OR inside HAVING |
 | 74 | `like` filter | orders WHERE status LIKE 'act%' | case-sensitive LIKE |
-| 75 | `not_like` filter | orders WHERE status NOT LIKE '%cancel%' | NOT LIKE |
+| 75 | `notLike` filter | orders WHERE status NOT LIKE '%cancel%' | NOT LIKE |
 | 77 | Order by aggregation alias | GROUP BY status, SUM(total) as totalSum, ORDER BY totalSum | ORDER BY aggregate alias |
 | 83 | Aggregation-only query (`columns: []`) | orders columns: [], SUM(total) | `SELECT SUM(total) FROM orders` |
 | 84 | `columns: undefined` + aggregations | orders columns: undefined, GROUP BY status, SUM(total) | groupBy columns only (not all) |
@@ -1280,15 +1280,15 @@ Tests are split between packages. Validation package tests run without DB connec
 | 93 | COUNT(*) aggregation | orders COUNT(*) as totalOrders | `SELECT COUNT(*) as "totalOrders" FROM ...` |
 | 94 | Dialect: parameter binding | orders WHERE status = 'active' | PG: `$1`, CH: `{p1:String}`, Trino: `?` |
 | 99 | `!=` filter | orders WHERE status != 'cancelled' | `!=` / `<>` per dialect |
-| 100 | `not_ilike` filter | users WHERE email NOT ILIKE '%@test%' | dialect-specific NOT ILIKE |
+| 100 | `notIlike` filter | users WHERE email NOT ILIKE '%@test%' | dialect-specific NOT ILIKE |
 | 101 | `>=` / `<=` filters | orders WHERE total >= 100 AND total <= 500 | range comparison |
 | 102 | MIN/MAX aggregations | orders MIN(createdAt) as earliest, MAX(createdAt) as latest | MIN/MAX preserve source type (timestamp) |
-| 108 | `levenshtein_lte` filter | users WHERE lastName levenshtein_lte { text: 'smith', maxDistance: 2 } | PG: `levenshtein(col,$1)<=$2`, CH: `editDistance(col,{p1:String})<={p2:UInt32}`, Trino: `levenshtein_distance(col,?)<= ?` |
+| 108 | `levenshteinLte` filter | users WHERE lastName levenshteinLte { text: 'smith', maxDistance: 2 } | PG: `levenshtein(col,$1)<=$2`, CH: `editDistance(col,{p1:String})<={p2:UInt32}`, Trino: `levenshtein_distance(col,?)<= ?` |
 | 110 | `between` filter | orders WHERE total BETWEEN 100 AND 500 | `col BETWEEN $1 AND $2` per dialect |
 | 111 | `contains` filter | users WHERE email contains 'example' | `LIKE '%example%'` (value auto-escaped) |
 | 112 | `icontains` filter | users WHERE email icontains 'EXAMPLE' | dialect-specific case-insensitive `LIKE '%example%'` |
-| 113 | `starts_with` filter | users WHERE email starts_with 'admin' | `LIKE 'admin%'` |
-| 114 | `istarts_with` filter | users WHERE email istarts_with 'ADMIN' | dialect-specific case-insensitive `LIKE 'ADMIN%'` |
+| 113 | `startsWith` filter | users WHERE email startsWith 'admin' | `LIKE 'admin%'` |
+| 114 | `istartsWith` filter | users WHERE email istartsWith 'ADMIN' | dialect-specific case-insensitive `LIKE 'ADMIN%'` |
 | 115 | Column-vs-column filter | orders WHERE total > discount (QueryColumnFilter) | `t0."total_amount" > t0."discount"` — no params |
 | 124 | Cross-table column filter | orders JOIN products, orders.total > products.price (QueryColumnFilter) | `t0."total_amount" > t1."price"` — cross-table, no params |
 | 125 | `contains` wildcard escaping | users WHERE email contains 'test%user' | `LIKE '%test\%user%'` — `%` in value auto-escaped |
@@ -1298,17 +1298,17 @@ Tests are split between packages. Validation package tests run without DB connec
 | 129 | AVG aggregation | orders AVG(total) as avgTotal | `SELECT AVG(t0."total_amount") as "avgTotal"` |
 | 155 | HAVING with `between` | orders GROUP BY status, HAVING SUM(total) BETWEEN 100 AND 500 | `HAVING SUM(t0."total_amount") BETWEEN $N AND $N+1` — uses `HavingBetween` IR |
 | 156 | byIds + JOIN | orders byIds=[uuid1,uuid2] JOIN products | `SELECT ... FROM orders t0 LEFT JOIN products t1 ON ... WHERE t0."id" = ANY($1)` — cache skipped |
-| 133 | `ends_with` filter | users WHERE email ends_with '@example.com' | `LIKE '%@example.com'` |
-| 134 | `iends_with` filter | users WHERE email iends_with '@EXAMPLE.COM' | dialect-specific case-insensitive `LIKE '%@EXAMPLE.COM'` |
-| 135 | `not_between` filter | orders WHERE total NOT BETWEEN 0 AND 10 | `NOT (col BETWEEN $1 AND $2)` per dialect |
-| 136 | `not_contains` filter | users WHERE email not_contains 'spam' | `NOT LIKE '%spam%'` |
-| 137 | `not_icontains` filter | users WHERE email not_icontains 'SPAM' | dialect-specific case-insensitive `NOT LIKE '%SPAM%'` |
+| 133 | `endsWith` filter | users WHERE email endsWith '@example.com' | `LIKE '%@example.com'` |
+| 134 | `iendsWith` filter | users WHERE email iendsWith '@EXAMPLE.COM' | dialect-specific case-insensitive `LIKE '%@EXAMPLE.COM'` |
+| 135 | `notBetween` filter | orders WHERE total NOT BETWEEN 0 AND 10 | `NOT (col BETWEEN $1 AND $2)` per dialect |
+| 136 | `notContains` filter | users WHERE email notContains 'spam' | `NOT LIKE '%spam%'` |
+| 137 | `notIcontains` filter | users WHERE email notIcontains 'SPAM' | dialect-specific case-insensitive `NOT LIKE '%SPAM%'` |
 | 138 | Top-level filter on joined column | orders JOIN products, top-level filter: { column: 'category', table: 'products', operator: '=', value: 'electronics' } | `t1."category" = $1` in WHERE (same as QueryJoin.filters) |
 | 142 | INNER JOIN | orders INNER JOIN products | `INNER JOIN` clause (vs default LEFT) |
 | 144 | NOT in HAVING group | orders GROUP BY status, HAVING NOT (SUM(total) > 100 OR COUNT(*) > 5) | `NOT (HAVING_cond1 OR HAVING_cond2)` — negated HAVING group |
 | 147 | Multi-join with per-table filters | orders JOIN products (category='electronics') JOIN users (role='admin') | 2 JOINs + 2 WHERE conditions from joined tables |
 | 148 | Filter with `table` = `from` table | orders, filter: { column: 'status', table: 'orders', operator: '=', value: 'active' } | `t0."order_status" = $1` — explicit from-table reference, same as omitting `table` |
-| 149 | `ends_with` wildcard escaping | users WHERE email ends_with '100%off' | `LIKE '%100\%off'` — `%` in value auto-escaped |
+| 149 | `endsWith` wildcard escaping | users WHERE email endsWith '100%off' | `LIKE '%100\%off'` — `%` in value auto-escaped |
 | 163 | `distinct` + `groupBy` | orders DISTINCT, GROUP BY status, SUM(total) as totalSum | both accepted (valid SQL) — `DISTINCT` has no effect when `GROUP BY` is present |
 | 164 | SUM on all-NULL column | orders SUM(discount) as totalDiscount (all discount values are NULL) | result: `totalDiscount = null`, `meta.columns[].nullable = true` (source column is nullable) |
 
