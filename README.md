@@ -209,28 +209,25 @@ If a column is declared as masked by a role but has no `maskingFn` in metadata, 
 
 Masked columns are still returned in results (not hidden), but their values are obfuscated.
 
-### Full Configuration
+### Metadata Configuration
 
 ```ts
-interface MultiDbConfig {
+interface MetadataConfig {
   databases: DatabaseMeta[]
   tables: TableMeta[]
   caches: CacheMeta[]
   externalSyncs: ExternalSync[]
-  roles: RoleMeta[]
   trino?: { enabled: boolean }
 }
 ```
 
-Metadata source is **abstracted** — hardcoded for now, in future loaded from a database or external service and cached.
-
 ### Metadata & Role Providers
 
-The config can be provided statically or loaded dynamically via providers:
+Metadata and roles are always loaded via providers. This keeps the API uniform — `reloadMetadata()` and `reloadRoles()` always work the same way regardless of source.
 
 ```ts
 interface MetadataProvider {
-  load(): Promise<Omit<MultiDbConfig, 'roles'>>
+  load(): Promise<MetadataConfig>
 }
 
 interface RoleProvider {
@@ -238,7 +235,16 @@ interface RoleProvider {
 }
 ```
 
-Providers are optional — if omitted, the system uses the static `config` object. Both providers support cache invalidation:
+For static configs (tests, simple apps), use the built-in helpers:
+
+```ts
+import { staticMetadata, staticRoles } from '@mkven/multi-db'
+
+const metadataProvider = staticMetadata({ databases: [...], tables: [...], ... })
+const roleProvider = staticRoles([...])
+```
+
+Both providers support cache invalidation:
 
 ```ts
 interface MultiDb {
@@ -263,10 +269,9 @@ interface HealthCheckResult {
 External systems signal staleness by calling `reloadMetadata()` or `reloadRoles()`. This is explicit — no polling, no TTL. Typical triggers: admin UI saves new config, CI/CD deploys schema changes, webhook from config service.
 
 ```ts
-const multiDb = createMultiDb({
-  // Static config OR providers (not both)
-  configProvider: myMetadataProvider,
-  roleProvider: myRoleProvider,
+const multiDb = await createMultiDb({
+  metadataProvider: staticMetadata({ databases: [...], tables: [...], ... }),
+  roleProvider: staticRoles([...]),
 
   executors: { ... },
   cacheProviders: { ... },
@@ -313,26 +318,26 @@ interface CacheProvider {
 
 ### Initialization (once at startup)
 
-The module is initialized with the full metadata configuration and optional executor/cache providers:
+The module is initialized with metadata and role providers, plus optional executor/cache instances:
 
 ```ts
-import { createMultiDb } from '@mkven/multi-db'
+import { createMultiDb, staticMetadata, staticRoles } from '@mkven/multi-db'
 import { createPostgresExecutor } from '@mkven/multi-db-executor-postgres'
 import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
 import { createTrinoExecutor } from '@mkven/multi-db-executor-trino'
 import { createRedisCache } from '@mkven/multi-db-cache-redis'
 
-// Returns MultiDb instance
-const multiDb = createMultiDb({
-  // Required: metadata configuration
-  config: {
+// Returns Promise<MultiDb> — async because it loads providers and pings connections
+const multiDb = await createMultiDb({
+  // Required: metadata and role providers
+  metadataProvider: staticMetadata({
     databases: [...],
     tables: [...],
     caches: [...],
     externalSyncs: [...],
-    roles: [...],
     trino: { enabled: true },
-  },
+  }),
+  roleProvider: staticRoles([...]),
 
   // Optional: executors (only needed for executeMode = 'execute' | 'count')
   // Keys must match DatabaseMeta.id, except 'trino' which is a special key for the federation layer
@@ -349,7 +354,8 @@ const multiDb = createMultiDb({
 })
 ```
 
-At init time:
+At init time (`createMultiDb` is async):
+- Providers are called: `metadataProvider.load()` and `roleProvider.load()`
 - All apiNames are validated (format, reserved words, uniqueness)
 - Metadata is indexed into in-memory Maps for O(1) lookups:
   - `Map<apiName, TableMeta>` — table by apiName
@@ -414,7 +420,7 @@ const countResult = await multiDb.query({
 
 | Provided at init | Provided per query |
 |---|---|
-| Metadata config (databases, tables, roles, syncs, caches) | Query definition (from, columns, filters, joins, etc.) |
+| Metadata + role providers | Query definition (from, columns, filters, joins, etc.) |
 | Executor instances (DB connections) | Execution context (scoped roles) |
 | Cache provider instances | `executeMode`, `debug`, `freshness` |
 
@@ -1109,7 +1115,7 @@ const roles: RoleMeta[] = [
 | Package name | `@mkven/multi-db` | Org-scoped, reusable |
 | Language | TypeScript | Type-safe, wide ecosystem |
 | Query format | Typed object literals | Type-safe, IDE support, no parser |
-| Metadata source | Abstracted (hardcoded now, DB/service later) | Flexibility without premature complexity |
+| Metadata source | Provider-based (always). Static helpers `staticMetadata()` / `staticRoles()` for simple cases | Uniform API — `reload` always works; no static/dynamic split |
 | Execution mode | SQL-only (`SqlResult`) or execution (`DataResult`) | Distinct return types per mode |
 | Freshness | Prefer original, allow specifying lag tolerance | Correctness by default, performance opt-in |
 | Access control | Scoped roles: UNION within scope, INTERSECTION between scopes | User accumulates perms, service restricts them |
