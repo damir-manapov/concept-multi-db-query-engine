@@ -573,7 +573,7 @@ interface DebugLogEntry {
 }
 ```
 
-When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, and `offset` are ignored. All modes include metadata. Debug log is included only when `debug: true`.
+When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, `offset`, and `distinct` are ignored (always emits `COUNT(*)`, never `COUNT(DISTINCT ...)`). All modes include metadata. Debug log is included only when `debug: true`.
 
 In `sql-only` mode, masking cannot be applied (no data to mask). However, `meta.columns[].masked` still reports masking intent so the caller can apply masking themselves after execution.
 
@@ -599,6 +599,7 @@ Given a query touching tables T1, T2, ... Tn:
 ### Priority 2 — Materialized Replica
 - Some tables are in different databases, BUT debezium replicas exist such that all needed data is available in one database
 - Check freshness: if query requires `realtime` but replica lag is `minutes` → skip this strategy
+- Freshness hierarchy (strictest to most relaxed): `realtime` < `seconds` < `minutes` < `hours`. A replica is acceptable when its `estimatedLag` ≤ the query's `freshness` tolerance
 - Always prefer the **original** database if the original data is there; use replicas for the "foreign" tables
 - If multiple databases could serve via replicas, prefer the one with the most original tables
 
@@ -813,8 +814,8 @@ interface JoinClause {
 interface WhereCondition {
   column: ColumnRef
   operator: string                    // '=', 'ILIKE', 'ANY', etc. — string (not union) because dialects may emit operators beyond the public QueryFilter set
-  paramIndex?: number                 // for parameterized values
-  literal?: string                    // for IS NULL, IS NOT NULL
+  paramIndex?: number                 // for parameterized values (mutually exclusive with `literal`)
+  literal?: string                    // for IS NULL, IS NOT NULL (mutually exclusive with `paramIndex`)
 }
 
 interface AggregationClause {
@@ -961,6 +962,7 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 25 | EXISTS filter | orders WHERE EXISTS invoices(status='paid') | correct EXISTS subquery per dialect |
 | 26 | NOT EXISTS filter | users WHERE NOT EXISTS orders | correct NOT EXISTS subquery per dialect |
 | 27 | Nested EXISTS + filter group | orders WHERE (status='active' OR EXISTS invoices) | EXISTS inside OR group |
+| 28 | OR filter group | orders WHERE (status='active' OR total > 100) | correct OR clause per dialect |
 
 ### Sample Column Definitions (orders table)
 
