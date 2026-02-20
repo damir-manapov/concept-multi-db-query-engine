@@ -22,9 +22,10 @@ This document breaks the concept into sequential implementation stages. Each sta
    - `context.ts` — `ExecutionContext`
 6. Define internal IR types in `packages/core/src/`:
    - `SqlParts`, `ColumnRef`, `TableRef`, `WhereNode` (all 8 variants), `HavingNode` (3 variants), `JoinClause`, `OrderByClause`, `AggregationClause`, `ColumnMapping`, `CorrelatedSubquery`
-   - `DbExecutor`, `CacheProvider` — interfaces implemented by executor/cache packages (Stage 11)
-7. Export public surface from `packages/validation/src/index.ts`
-8. Verify: `pnpm build` succeeds across all packages (types compile)
+7. Define public executor/cache interfaces in `packages/core/src/`:
+   - `DbExecutor`, `CacheProvider` — implemented by executor/cache packages (Stage 11)
+8. Export public surface from `packages/validation/src/index.ts`
+9. Verify: `pnpm build` succeeds across all packages (types compile)
 
 **Exit criteria:** All interfaces/types compile. `pnpm build` passes. No runtime code yet.
 
@@ -175,7 +176,7 @@ This document breaks the concept into sequential implementation stages. Each sta
 10. Resolve `QueryColumnFilter` — two `ColumnRef`s, no params
 11. Resolve filter operators to `WhereNode` variants (`WhereCondition`, `WhereBetween`, `WhereFunction`, `WhereArrayCondition`, `WhereGroup`, `WhereExists`, `WhereCountedSubquery`)
 12. Resolve `having` to `HavingNode` — bare alias strings, not `ColumnRef`
-13. Handle `byIds` → `WHERE pk = ANY($1)` condition
+13. Handle `byIds` → produce `WhereCondition` with `in` operator for PK column
 14. Handle `count` mode → override to `SELECT COUNT(*)`
 
 **Exit criteria:** All query shapes produce correct `SqlParts` and `ColumnMapping[]`.
@@ -279,7 +280,7 @@ This document breaks the concept into sequential implementation stages. Each sta
    - If multiple candidate databases, prefer the one with most originals
 5. Implement P3 — Trino cross-database:
    - Trino enabled, all databases have `trinoCatalog`
-   - Cross-catalog SQL generation
+   - Select Trino executor and provide catalog-qualified table references to SQL generation (Stage 9)
 6. Implement P4 — Error:
    - `PlannerError` with specific code (`UNREACHABLE_TABLES`, `TRINO_DISABLED`, `NO_CATALOG`, `FRESHNESS_UNMET`)
 7. Strategy priority: P0 > P1 > P2 > P3 > P4
