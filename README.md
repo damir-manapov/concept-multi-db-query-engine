@@ -5,7 +5,7 @@
 Build a reusable, metadata-driven query engine that lets applications query, filter, join, and aggregate data across Postgres, ClickHouse, Iceberg, and Redis through a single typed API. The engine:
 
 - Accepts queries using **apiNames** (decoupled from physical schema)
-- Supports **rich filtering** — 26 operators (comparison, pattern, range, fuzzy), column-vs-column comparisons, recursive AND/OR groups, EXISTS/NOT EXISTS subqueries with optional counted variant
+- Supports **rich filtering** — 31 operators (comparison, pattern, range, fuzzy, array), column-vs-column comparisons, recursive AND/OR groups, EXISTS/NOT EXISTS subqueries with optional counted variant
 - Supports **JOINs** (inner/left) resolved from relation metadata, **GROUP BY**, and **aggregations** (count, sum, avg, min, max) with HAVING
 - Automatically selects the **optimal execution strategy** — direct DB, cached, materialized replica, or Trino cross-DB federation
 - Enforces **scoped access control** — user roles and service roles intersected to determine effective permissions
@@ -116,12 +116,14 @@ interface TableMeta {
 ### Columns
 
 ```ts
-type ColumnType = 'string' | 'int' | 'decimal' | 'boolean' | 'uuid' | 'date' | 'timestamp'
+type ScalarColumnType = 'string' | 'int' | 'decimal' | 'boolean' | 'uuid' | 'date' | 'timestamp'
+type ArrayColumnType = 'string[]' | 'int[]' | 'decimal[]' | 'boolean[]' | 'uuid[]' | 'date[]' | 'timestamp[]'
+type ColumnType = ScalarColumnType | ArrayColumnType
 
 interface ColumnMeta {
   apiName: string                     // 'customerEmail'
   physicalName: string                // 'customer_email'
-  type: ColumnType                    // logical type used for filter operator validation and aggregation type inference
+  type: ColumnType                    // logical type; array types end with '[]' (e.g. 'string[]'); element type derived by stripping '[]'
   nullable: boolean
   maskingFn?: 'email' | 'phone' | 'name' | 'uuid' | 'number' | 'date' | 'full'
                                       // how to mask this column when masking is applied by role
@@ -510,10 +512,14 @@ interface QueryFilter {
            | 'contains' | 'icontains' | 'notContains' | 'notIcontains'
            | 'startsWith' | 'istartsWith' | 'endsWith' | 'iendsWith'
            | 'levenshteinLte'
-  value?: unknown                     // scalar for most operators; array for 'in'/'notIn'; omit for 'isNull'/'isNotNull'
+           | 'arrayContains' | 'arrayContainsAll' | 'arrayContainsAny'
+           | 'arrayIsEmpty' | 'arrayIsNotEmpty'
+  value?: unknown                     // scalar for most operators; array for 'in'/'notIn'; omit for 'isNull'/'isNotNull'/'arrayIsEmpty'/'arrayIsNotEmpty'
                                       // for 'between'/'notBetween': { from: unknown, to: unknown } (inclusive range)
                                       // for 'levenshteinLte': { text: string, maxDistance: number }
                                       // for 'contains'/'icontains'/'notContains'/'notIcontains'/'startsWith'/'istartsWith'/'endsWith'/'iendsWith': plain string (no wildcards — added internally)
+                                      // for 'arrayContains': single element matching the array's element type
+                                      // for 'arrayContainsAll'/'arrayContainsAny': non-empty array of elements matching element type
 }
 
 // Column-vs-column comparison — right side is another column, not a literal value
@@ -680,43 +686,50 @@ Given a query touching tables T1, T2, ... Tn:
 2. **Column existence** — only columns defined in table metadata can be referenced. When `columns` is `undefined` and `aggregations` is present, the default is `groupBy` columns only (not all allowed columns) — this avoids rule 7 failures from ungrouped columns being added automatically
 3. **Role permission** — if a table is not in the role's `tables` list → access denied
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
-5. **Filter validity** — filter operators must be valid for the column type (see table below); `isNull`/`isNotNull` additionally require `nullable: true`; malformed compound values (`between`/`notBetween` missing `to`, `between`/`notBetween` with `null` as `from` or `to`, `levenshteinLte` with non-integer or negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `between`/`notBetween` with `null` bounds are rejected for the same reason as `in`/`notIn` NULL — SQL `BETWEEN NULL AND x` always yields false due to 3-valued logic; `in`/`notIn` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`notIn` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
+5. **Filter validity** — filter operators must be valid for the column type (see table below); `isNull`/`isNotNull` additionally require `nullable: true`; malformed compound values (`between`/`notBetween` missing `to`, `between`/`notBetween` with `null` as `from` or `to`, `levenshteinLte` with non-integer or negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `between`/`notBetween` with `null` bounds are rejected for the same reason as `in`/`notIn` NULL — SQL `BETWEEN NULL AND x` always yields false due to 3-valued logic; `in`/`notIn` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`notIn` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; **array operators** (`arrayContains`, `arrayContainsAll`, `arrayContainsAny`, `arrayIsEmpty`, `arrayIsNotEmpty`) are only valid on array column types (e.g. `'string[]'`); `arrayContains` value must match the element type; `arrayContainsAll`/`arrayContainsAny` value must be a non-empty array with all elements matching the element type (same validation as `in`/`notIn` element type check); conversely, all scalar operators (except `isNull`/`isNotNull`) are rejected on array columns; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable) — array columns are not allowed in `QueryColumnFilter`; filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database. When `QueryGroupBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
-8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL); only comparison, range, and null-check operators are allowed — `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `notIn`, `between`, `notBetween`, `isNull`, `isNotNull`; pattern operators (`like`, `ilike`, `contains`, `startsWith`, `endsWith`, and their `not`/`i` variants) and `levenshteinLte` are rejected — they operate on text values, not aggregated numbers
+8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL); only comparison, range, and null-check operators are allowed — `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `notIn`, `between`, `notBetween`, `isNull`, `isNotNull`; pattern operators (`like`, `ilike`, `contains`, `startsWith`, `endsWith`, and their `not`/`i` variants), `levenshteinLte`, and array operators (`arrayContains`, `arrayContainsAll`, `arrayContainsAny`, `arrayIsEmpty`, `arrayIsNotEmpty`) are rejected — they operate on text values or array columns, not aggregated numbers
 9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`. When `QueryOrderBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`; `byIds` + `joins` is valid — cache (P0) is skipped (cache stores single-table data) but direct DB (P1+) handles it normally (`WHERE pk = ANY($1)` with JOINs)
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided; `offset` requires `limit` (offset without limit is rejected)
 12. **Exists filter validity** — `QueryExistsFilter.table` must have a defined relation to the `from` table (or a joining table); role must allow access to the related table; when `count` is provided, `value` must be a non-negative integer; `exists` is ignored when `count` is present (the count operator handles directionality); `exists` defaults to `true` when omitted. **Nested EXISTS:** `QueryExistsFilter.filters` may contain another `QueryExistsFilter` (e.g. orders EXISTS invoices WHERE EXISTS lineItems). The inner EXISTS resolves its `table` relation against the **outer** EXISTS's table (not the query's `from`) — the system walks the nesting chain to find the correct parent for relation lookup
 13. **Role existence** — all role IDs in `ExecutionContext.roles` must exist in loaded roles; unknown IDs are rejected with `UNKNOWN_ROLE`
-14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); when `QueryAggregation.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected
+14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); when `QueryAggregation.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected; `sum`/`avg`/`min`/`max` on array columns are rejected — only `count` is valid on array columns (counts non-NULL array values, regardless of array contents)
 
 All validation errors are **collected, not thrown one at a time**. The system runs all applicable checks and throws a single `ValidationError` containing every issue found. This lets callers fix all problems at once instead of playing whack-a-mole.
 
 ### Filter Operator / Column Type Compatibility
 
-| Operator | string | int | decimal | boolean | uuid | date | timestamp |
-|---|---|---|---|---|---|---|---|
-| `=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `!=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `>` `<` `>=` `<=` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
-| `in` `notIn` | ✓ | ✓ | ✓ | — | ✓ | — | — |
-| `like` `notLike` | ✓ | — | — | — | — | — | — |
-| `ilike` `notIlike` | ✓ | — | — | — | — | — | — |
-| `between` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
-| `notBetween` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ |
-| `contains` `icontains` | ✓ | — | — | — | — | — | — |
-| `notContains` `notIcontains` | ✓ | — | — | — | — | — | — |
-| `startsWith` `istartsWith` | ✓ | — | — | — | — | — | — |
-| `endsWith` `iendsWith` | ✓ | — | — | — | — | — | — |
-| `isNull` `isNotNull` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
-| `levenshteinLte` | ✓ | — | — | — | — | — | — |
+| Operator | string | int | decimal | boolean | uuid | date | timestamp | T[] (array) |
+|---|---|---|---|---|---|---|---|---|
+| `=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| `!=` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| `>` `<` `>=` `<=` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | — |
+| `in` `notIn` | ✓ | ✓ | ✓ | — | ✓ | — | — | — |
+| `like` `notLike` | ✓ | — | — | — | — | — | — | — |
+| `ilike` `notIlike` | ✓ | — | — | — | — | — | — | — |
+| `between` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | — |
+| `notBetween` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | — |
+| `contains` `icontains` | ✓ | — | — | — | — | — | — | — |
+| `notContains` `notIcontains` | ✓ | — | — | — | — | — | — | — |
+| `startsWith` `istartsWith` | ✓ | — | — | — | — | — | — | — |
+| `endsWith` `iendsWith` | ✓ | — | — | — | — | — | — | — |
+| `isNull` `isNotNull` | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* | ✓* |
+| `levenshteinLte` | ✓ | — | — | — | — | — | — | — |
+| `arrayContains` | — | — | — | — | — | — | — | ✓ |
+| `arrayContainsAll` | — | — | — | — | — | — | — | ✓ |
+| `arrayContainsAny` | — | — | — | — | — | — | — | ✓ |
+| `arrayIsEmpty` | — | — | — | — | — | — | — | ✓ |
+| `arrayIsNotEmpty` | — | — | — | — | — | — | — | ✓ |
 
-`QueryColumnFilter` is not listed — it supports `=`, `!=`, `>`, `<`, `>=`, `<=` with the same type restrictions as those operators. Both columns must have compatible types.
+`QueryColumnFilter` is not listed — it supports `=`, `!=`, `>`, `<`, `>=`, `<=` with the same type restrictions as those operators. Both columns must have compatible types. Array columns are not allowed in `QueryColumnFilter`.
 
-\* `isNull` / `isNotNull` are valid on any type but only on columns with `nullable: true`.
+\* `isNull` / `isNotNull` are valid on any type (including arrays) but only on columns with `nullable: true`.
 
 Comparison operators (`>`, `<`, `>=`, `<=`) are rejected on `uuid` and `boolean` — UUIDs have no meaningful ordering, booleans should use `=`/`!=`. `in`/`notIn` are rejected on `date`/`timestamp` — use range comparisons instead. `between`/`notBetween` follow the same type rules as `>=`/`<=` (orderable types only — excludes `uuid` and `boolean`); `notBetween` emits `NOT (col BETWEEN $1 AND $2)`. `like`/`ilike`/`contains`/`icontains`/`notContains`/`notIcontains`/`startsWith`/`istartsWith`/`endsWith`/`iendsWith` are string-only. `contains`/`icontains` map to `LIKE '%x%'` / `ILIKE '%x%'`; `notContains`/`notIcontains` map to `NOT LIKE '%x%'` / `NOT ILIKE '%x%'` — wildcard characters in the value are escaped automatically. `startsWith`/`istartsWith` map to `LIKE 'x%'` / `ILIKE 'x%'`; `endsWith`/`iendsWith` map to `LIKE '%x'` / `ILIKE '%x'`. `levenshteinLte` is string-only — it matches rows where the Levenshtein edit distance between the column value and the target text is ≤ `maxDistance`. No index support in any dialect — always a full scan. PostgreSQL requires the `fuzzystrmatch` extension (`CREATE EXTENSION fuzzystrmatch`).
+
+**Array operators** are valid only on array column types (`'string[]'`, `'int[]'`, etc.). All scalar operators (except `isNull`/`isNotNull`) are rejected on array columns. `arrayContains` checks if the array column contains a single element (value must match element type). `arrayContainsAll` checks if the array contains ALL given elements (value is a non-empty array). `arrayContainsAny` checks if the array contains ANY of the given elements (overlap check, value is a non-empty array). `arrayIsEmpty` / `arrayIsNotEmpty` check if the array has zero / non-zero elements — no value needed. Note: `arrayIsEmpty` is distinct from `isNull` — an empty array `[]` is not NULL.
 
 `QueryFilter.table` allows filtering on joined table columns directly in the top-level `filters[]` array, as an alternative to placing filters in `QueryJoin.filters`. Both approaches produce the same SQL (filter goes in WHERE, not ON). When `table` is omitted, the column is resolved against the `from` table. If the `from` table and a joined table share an apiName, the unqualified name resolves to the `from` table — use `table` to disambiguate.
 
@@ -863,6 +876,12 @@ This decouples the API contract from database schema evolution.
 | NOT BETWEEN | `col NOT BETWEEN $1 AND $2` | `NOT (col BETWEEN {p1} AND {p2})` | `col NOT BETWEEN ? AND ?` |
 | Boolean | `true/false` | `1/0` | `true/false` |
 | Counted subquery | `(SELECT COUNT(*) FROM ... WHERE ...) >= $N` | `(SELECT COUNT(*) FROM ... WHERE ...) >= {pN:UInt64}` | `(SELECT COUNT(*) FROM ... WHERE ...) >= ?` |
+| Array column type | `text[]`, `integer[]`, etc. | `Array(String)`, `Array(Int32)`, etc. | `array(varchar)`, `array(integer)`, etc. |
+| `arrayContains` | `$1 = ANY(col)` | `has(col, {p1})` | `contains(col, ?)` |
+| `arrayContainsAll` | `col @> $1::type[]` | `hasAll(col, [{p1}, ...])` | `cardinality(array_except(ARRAY[?,...], col)) = 0` |
+| `arrayContainsAny` | `col && $1::type[]` | `hasAny(col, [{p1}, ...])` | `arrays_overlap(col, ARRAY[?,...])` |
+| `arrayIsEmpty` | `cardinality(col) = 0` | `empty(col)` | `cardinality(col) = 0` |
+| `arrayIsNotEmpty` | `cardinality(col) > 0` | `notEmpty(col)` | `cardinality(col) > 0` |
 
 **Performance note — counted subqueries:** `COUNT(*)` scans all matching rows even when only a threshold is needed. For `>= N` / `> N` comparisons, the system can optimize by adding `LIMIT N` inside the subquery: `(SELECT COUNT(*) FROM (SELECT 1 FROM ... WHERE ... LIMIT N)) >= N`. This short-circuits counting once the threshold is reached. Not applied for `=` / `!=` / `<` / `<=` (which need the exact count). The optimization is per-dialect and transparent to the caller.
 
@@ -876,6 +895,8 @@ This decouples the API contract from database schema evolution.
 | `uuid` | `uuid` | `$1::uuid[]` |
 
 Only types that support `in`/`notIn` are listed (`boolean`, `date`, `timestamp` are rejected by rule 5). ClickHouse and Trino expand values inline and don't need type casts.
+
+**Postgres array operator type mapping:** `arrayContainsAll` (`@>`) and `arrayContainsAny` (`&&`) use the same type casts as `in`/`notIn` — e.g. `col @> $1::text[]`. `arrayContains` (`= ANY`) uses the scalar type cast — e.g. `$1::text = ANY(col)`. ClickHouse and Trino use function-based syntax and don't need casts.
 
 Each engine gets a `SqlDialect` implementation.
 
@@ -930,7 +951,7 @@ interface SqlParts {
 }
 
 // Recursive WHERE tree — mirrors QueryFilterGroup at the physical level
-type WhereNode = WhereCondition | WhereColumnCondition | WhereBetween | WhereFunction | WhereGroup | WhereExists | WhereCountedSubquery
+type WhereNode = WhereCondition | WhereColumnCondition | WhereBetween | WhereFunction | WhereArrayCondition | WhereGroup | WhereExists | WhereCountedSubquery
 
 // Function-based condition — for operators that wrap the column in a function (e.g. levenshteinLte)
 interface WhereFunction {
@@ -941,8 +962,16 @@ interface WhereFunction {
   compareParamIndex: number           // param index for the comparison value (the max distance)
 }
 
-// HAVING tree — same as WhereNode but excludes EXISTS, WhereColumnCondition, and WhereFunction
-// Only comparison + range + null operators are allowed (no pattern/function operators on aliases)
+// Array filter condition — for arrayContains, arrayContainsAll, arrayContainsAny, arrayIsEmpty, arrayIsNotEmpty
+interface WhereArrayCondition {
+  column: ColumnRef
+  operator: 'contains' | 'containsAll' | 'containsAny' | 'isEmpty' | 'isNotEmpty'
+  paramIndexes?: number[]             // contains: single index; containsAll/containsAny: one index per element; omit for isEmpty/isNotEmpty
+  elementType: string                 // SQL element type for Postgres casting (e.g. 'text', 'integer'); ClickHouse/Trino don't use it
+}
+
+// HAVING tree — same as WhereNode but excludes EXISTS, WhereColumnCondition, WhereFunction, and WhereArrayCondition
+// Only comparison + range + null operators are allowed (no pattern/function/array operators on aliases)
 type HavingNode = WhereCondition | HavingBetween | HavingGroup
 
 // Range condition on an aggregation alias — uses bare string, not ColumnRef
@@ -1209,6 +1238,14 @@ Tests are split between packages. Validation package tests run without DB connec
 | 167 | `levenshteinLte` fractional maxDistance | users WHERE lastName levenshteinLte { text: 'x', maxDistance: 1.5 } | rule 5 — INVALID_VALUE (maxDistance must be non-negative integer) |
 | 168 | `between` with null `from` | orders WHERE total between { from: null, to: 100 } | rule 5 — INVALID_VALUE (`from`/`to` must not be null — SQL BETWEEN NULL always false) |
 | 169 | `notBetween` with null `to` | orders WHERE total notBetween { from: 0, to: null } | rule 5 — INVALID_VALUE (same rationale as `between` null rejection) |
+| 173 | `arrayContains` on scalar column | orders WHERE status arrayContains 'active' (status is 'string', not array) | rule 5 — INVALID_FILTER (array operators only valid on array column types) |
+| 174 | Scalar operator on array column | events WHERE tags = 'urgent' (tags is 'string[]') | rule 5 — INVALID_FILTER (scalar operators except isNull/isNotNull rejected on array columns) |
+| 175 | `arrayContains` type mismatch | events WHERE tags arrayContains 123 (tags is 'string[]', value is number) | rule 5 — INVALID_VALUE (element type must match: expected string) |
+| 176 | `arrayContainsAll` empty array | products WHERE labels arrayContainsAll [] | rule 5 — INVALID_VALUE (empty array — same as `in` empty rejection) |
+| 177 | `arrayContainsAny` type mismatch | products WHERE labels arrayContainsAny [1, 2] (labels is 'string[]') | rule 5 — INVALID_VALUE (all elements must match element type) |
+| 178 | `arrayContains` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'arrayContains' } | rule 8 — INVALID_HAVING: array operators rejected in HAVING |
+| 179 | SUM on array column | events SUM(tags) as tagSum | rule 14 — INVALID_AGGREGATION: sum/avg/min/max rejected on array columns |
+| 180 | QueryColumnFilter on array column | events WHERE tags > status (tags is 'string[]') | rule 5 — array columns not allowed in QueryColumnFilter |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1333,6 +1370,11 @@ Tests are split between packages. Validation package tests run without DB connec
 | 149 | `endsWith` wildcard escaping | users WHERE email endsWith '100%off' | `LIKE '%100\%off'` — `%` in value auto-escaped |
 | 163 | `distinct` + `groupBy` | orders DISTINCT, GROUP BY status, SUM(total) as totalSum | both accepted (valid SQL) — `DISTINCT` has no effect when `GROUP BY` is present |
 | 164 | SUM on all-NULL column | orders SUM(discount) as totalDiscount (all discount values are NULL) | result: `totalDiscount = null`, `meta.columns[].nullable = true` (source column is nullable) |
+| 181 | `arrayContains` filter | events WHERE tags arrayContains 'urgent' | PG: `$1::text = ANY(t0."tags")`, CH: `has(t0.\`tags\`, {p1})`, Trino: `contains(t0."tags", ?)` |
+| 182 | `arrayContainsAll` filter | products WHERE labels arrayContainsAll ['sale', 'new'] | PG: `t0."labels" @> $1::text[]`, CH: `hasAll(t0.\`labels\`, [{p1}, {p2}])`, Trino: `cardinality(array_except(ARRAY[?,?], t0."labels")) = 0` |
+| 183 | `arrayContainsAny` filter | products WHERE labels arrayContainsAny ['sale', 'clearance'] | PG: `t0."labels" && $1::text[]`, CH: `hasAny(...)`, Trino: `arrays_overlap(t0."labels", ARRAY[?,?])` |
+| 184 | `arrayIsEmpty` filter | events WHERE tags arrayIsEmpty | PG: `cardinality(t0."tags") = 0`, CH: `empty(t0.\`tags\`)`, Trino: `cardinality(t0."tags") = 0` |
+| 185 | `arrayIsNotEmpty` filter | products WHERE labels arrayIsNotEmpty | PG: `cardinality(t0."labels") > 0`, CH: `notEmpty(...)`, Trino: `cardinality(...) > 0` |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1402,6 +1444,7 @@ const productsColumns: ColumnMeta[] = [
   { apiName: 'name',      physicalName: 'name',        type: 'string',  nullable: false },
   { apiName: 'category',  physicalName: 'category',    type: 'string',  nullable: false },
   { apiName: 'price',     physicalName: 'price',       type: 'decimal', nullable: false, maskingFn: 'number' },
+  { apiName: 'labels',    physicalName: 'labels',      type: 'string[]', nullable: true },   // text[] in Postgres
   { apiName: 'tenantId',  physicalName: 'tenant_id',   type: 'uuid',    nullable: false },
 ]
 ```
@@ -1451,7 +1494,7 @@ const metricsColumns: ColumnMeta[] = [
   { apiName: 'id',        physicalName: 'id',          type: 'uuid',      nullable: false },
   { apiName: 'name',      physicalName: 'metric_name', type: 'string',    nullable: false },
   { apiName: 'value',     physicalName: 'value',       type: 'decimal',   nullable: false },
-  { apiName: 'tags',      physicalName: 'tags',        type: 'string',    nullable: true },
+  { apiName: 'tags',      physicalName: 'tags',        type: 'string[]',  nullable: true },  // Array(String) in ClickHouse
   { apiName: 'timestamp', physicalName: 'ts',          type: 'timestamp', nullable: false },
 ]
 ```
@@ -1583,6 +1626,7 @@ const roles: RoleMeta[] = [
 | Executor timeout | Per-executor `timeoutMs` in factory config, no global default | Each DB has different performance profiles — Postgres: 30s, ClickHouse: 60s, Trino: 120s. Driver-level enforcement (`statement_timeout`, `max_execution_time`) is more reliable than `Promise.race` |
 | Concurrent safety | `query()` uses snapshot of metadata/roles; `reload*()` atomically swaps references | No locking needed — immutable config per query, atomic reference swap for reloads |
 | `close()` error handling | Attempt all providers, collect failures, throw aggregate error | Partial close would leak connections — always try all, report all failures |
+| Array columns | `ScalarColumnType` + `ArrayColumnType` union, 5 array operators, element type derived by stripping `[]` | All three backends (Postgres, ClickHouse, Trino/Iceberg) support arrays natively. Element type validation reuses `ScalarColumnType`. Array columns excluded from `QueryColumnFilter` and `sum`/`avg`/`min`/`max` aggregations |
 
 ---
 
@@ -1660,7 +1704,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1696,7 +1740,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── init/                # scenarios 53, 54, 55, 63
 │   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164, 166
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164, 166, 181–185
 │   │       ├── cache/               # scenario 35
 │   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152, 170–172
 │   │
