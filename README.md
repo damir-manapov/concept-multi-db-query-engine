@@ -1001,7 +1001,7 @@ interface HavingBetween {
 
 interface HavingGroup {
   logic: 'and' | 'or'
-  not?: boolean
+  not?: boolean                       // when true, emits NOT (...)
   conditions: HavingNode[]
 }
 
@@ -1274,6 +1274,8 @@ Tests are split between packages. Validation package tests run without DB connec
 | 230 | `in` on timestamp column | orders WHERE createdAt IN ('2024-01-01T00:00:00Z') | rule 5 — INVALID_FILTER (`in` rejected on `timestamp` type) |
 | 231 | `between` on uuid column | orders WHERE id BETWEEN 'uuid1' AND 'uuid2' | rule 5 — INVALID_FILTER (`between` rejected on `uuid` — no meaningful ordering) |
 | 232 | `notIn` on boolean column | orders WHERE isPaid NOT IN (true) | rule 5 — INVALID_FILTER (`notIn` rejected on `boolean` type) |
+| 234 | `notBetween` on boolean column | orders WHERE isPaid NOT BETWEEN true AND false | rule 5 — INVALID_FILTER (`notBetween` rejected on `boolean` — not orderable) |
+| 235 | `notBetween` on uuid column | orders WHERE id NOT BETWEEN 'uuid1' AND 'uuid2' | rule 5 — INVALID_FILTER (`notBetween` rejected on `uuid` — no meaningful ordering) |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1918,7 +1920,7 @@ This ensures both implementations behave identically — same results, same erro
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180, 187, 190–192, 195, 198, 199, 229–232
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180, 187, 190–192, 195, 198, 199, 229–232, 234, 235
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
