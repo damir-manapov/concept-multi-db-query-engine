@@ -88,7 +88,7 @@ Every phase emits structured debug log entries (when `debug: true` is set on the
 type DatabaseEngine = 'postgres' | 'clickhouse' | 'iceberg'
 
 interface DatabaseMeta {
-  id: string                          // logical id: 'main-pg', 'analytics-ch'
+  id: string                          // logical id: 'pg-main', 'ch-analytics'
   engine: DatabaseEngine
   trinoCatalog?: string               // if accessible via trino, its catalog name
 }
@@ -469,7 +469,7 @@ type QueryResult<T = unknown> = SqlResult | DataResult<T> | CountResult
 
 interface QueryResultMeta {
   strategy: 'direct' | 'cache' | 'materialized' | 'trino-cross-db'
-  targetDatabase: string             // which DB was queried
+  targetDatabase: string             // which DB was queried; for cache strategy: the CacheMeta.id (e.g. 'redis-main')
   dialect: 'postgres' | 'clickhouse' | 'trino'  // iceberg is always queried via trino
   tablesUsed: {
     tableId: string
@@ -501,6 +501,8 @@ interface DebugLogEntry {
 
 When you request execution (`executeMode = 'execute'`), you get data back — no SQL. When you request SQL only (`executeMode = 'sql-only'`), you get SQL + params — no execution, no data. When you request count (`executeMode = 'count'`), you get just the row count — `columns`, `orderBy`, `limit`, and `offset` are ignored. All modes include metadata. Debug log is included only when `debug: true`.
 
+In `sql-only` mode, masking cannot be applied (no data to mask). However, `meta.columns[].masked` still reports masking intent so the caller can apply masking themselves after execution.
+
 ---
 
 ## Query Planner Strategy
@@ -509,6 +511,7 @@ Given a query touching tables T1, T2, ... Tn:
 
 ### Priority 0 — Cache (redis)
 - Only for `byIds` queries **without `filters`** (filters skip cache — too ambiguous to post-filter)
+- Only for single-table queries **without `joins`** (cache stores single-table data)
 - Only for tables with single-column primary keys (composite PKs use filters instead)
 - Check if the table has a cache config
 - If cache hit for all IDs → return from cache (trim columns if needed, apply masking identically to DB results)
@@ -1066,6 +1069,8 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       │   ├── postgres.ts
 │   │       │   ├── clickhouse.ts
 │   │       │   └── trino.ts
+│   │       ├── resolution/
+│   │       │   └── resolver.ts      # apiName → physicalName, produces SqlParts + ColumnMapping[]
 │   │       ├── generator/
 │   │       │   ├── generator.ts     # SQL generation from resolved plan
 │   │       │   └── fragments.ts     # reusable SQL building blocks
