@@ -483,6 +483,9 @@ interface QueryJoin {
   type?: 'inner' | 'left'            // default: 'left' (safe for nullable FKs)
   columns?: string[]                  // columns to select from joined table; undefined = all allowed for role; [] = no columns (join used for filter/groupBy only)
   filters?: (QueryFilter | QueryColumnFilter | QueryFilterGroup | QueryExistsFilter)[]  // filters on joined table
+  // Within join filters, omitting `table` on a QueryFilter resolves the column against the **joined**
+  // table (not the `from` table). This is the natural default — you're declaring filters *for* this join.
+  // Specifying `table` explicitly overrides this and allows referencing any table in the query (from or any join).
   // NOTE: Join filters are placed in WHERE, not ON. The ON clause only contains the join condition
   // (FK = PK from relation metadata). For LEFT JOINs this means join-scoped filters effectively
   // convert to INNER JOIN semantics — rows where the joined table doesn't match the filter are
@@ -492,6 +495,7 @@ interface QueryJoin {
 interface QueryFilter {
   column: string                      // apiName (or aggregation alias when used in `having`)
   table?: string                      // apiName of table; omit for `from` table. Allows filtering on joined table columns at top level
+                                      // Exception: inside QueryJoin.filters, omitting `table` resolves against the joined table (not `from`)
   operator: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'in' | 'not_in' | 'like' | 'not_like' | 'ilike' | 'not_ilike'
            | 'is_null' | 'is_not_null' | 'between' | 'not_between'
            | 'contains' | 'icontains' | 'not_contains' | 'not_icontains'
@@ -669,14 +673,14 @@ Given a query touching tables T1, T2, ... Tn:
 4. **Column permission** — if `allowedColumns` is a list and requested column is not in it → denied; if columns not specified in query, return only allowed ones
 5. **Filter validity** — filter operators must be valid for the column type (see table below); `is_null`/`is_not_null` additionally require `nullable: true`; malformed compound values (`between`/`not_between` missing `to`, `levenshtein_lte` with negative `maxDistance`, `in` with empty array) are rejected with `INVALID_VALUE`; `in`/`not_in` additionally validate that all array elements match the column type (e.g. passing `['a','b']` on an `int` column → `INVALID_VALUE`); `in`/`not_in` also reject `null` elements — SQL's `NOT IN (1, NULL)` always returns zero rows due to 3-valued logic, which is a major footgun; when `QueryFilter.table` is provided, the table must be the `from` table or one of the joined tables — referencing a non-joined table is rejected; for `QueryColumnFilter`, both columns must exist, the role must allow both, and their types must be compatible (same type, or both orderable); filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
-7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database
+7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Prevents invalid SQL from reaching the database. When `QueryGroupBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryFilter.table` is rejected inside `having` (HAVING operates on aggregation aliases, not table columns); `QueryColumnFilter` nested inside `having` groups is rejected (HAVING compares aliases, not table columns — column-vs-column comparison is not meaningful); `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL); only comparison, range, and null-check operators are allowed — `=`, `!=`, `>`, `<`, `>=`, `<=`, `in`, `not_in`, `between`, `not_between`, `is_null`, `is_not_null`; pattern operators (`like`, `ilike`, `contains`, `starts_with`, `ends_with`, and their `not_`/`i` variants) and `levenshtein_lte` are rejected — they operate on text values, not aggregated numbers
-9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`
+9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`. When `QueryOrderBy.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5)
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`; `byIds` + `joins` is valid — cache (P0) is skipped (cache stores single-table data) but direct DB (P1+) handles it normally (`WHERE pk = ANY($1)` with JOINs)
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided; `offset` requires `limit` (offset without limit is rejected)
 12. **Exists filter validity** — `QueryExistsFilter.table` must have a defined relation to the `from` table (or a joining table); role must allow access to the related table; when `count` is provided, `value` must be a non-negative integer; `exists` is ignored when `count` is present (the count operator handles directionality); `exists` defaults to `true` when omitted
 13. **Role existence** — all role IDs in `ExecutionContext.roles` must exist in loaded roles; unknown IDs are rejected with `UNKNOWN_ROLE`
-14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected
+14. **Aggregation validity** — aggregation aliases must be unique across all aggregations; aliases must not collide with column apiNames present in the result set (avoids ambiguous output columns); when `QueryAggregation.table` is provided, the table must be the `from` table or one of the joined tables — same rule as filter `table` (rule 5); explicit empty `columns: []` is only valid when `aggregations` is present (aggregation-only query, e.g. `SELECT SUM(total) FROM orders`) — empty `columns: []` without aggregations is rejected
 
 All validation errors are **collected, not thrown one at a time**. The system runs all applicable checks and throws a single `ValidationError` containing every issue found. This lets callers fix all problems at once instead of playing whack-a-mole.
 
@@ -1149,7 +1153,6 @@ Tests are split between packages. Validation package tests run without DB connec
 | 157 | `exists: false` + `count` (allowed) | orders EXISTS(false) invoices count: { operator: '>=', value: 3 } | `exists` ignored when `count` present — no error, emits counted subquery |
 | 158 | `count.value` negative | orders EXISTS invoices count: { operator: '>=', value: -1 } | rule 12 — INVALID_EXISTS (value must be ≥ 0) |
 | 159 | `count.value` non-integer | orders EXISTS invoices count: { operator: '>=', value: 2.5 } | rule 12 — INVALID_EXISTS (value must be integer) |
-| 162 | `exists` omitted (defaults true) | orders { table: 'invoices' } (no explicit `exists`) | EXISTS subquery — `exists` defaults to `true` |
 | 46 | Invalid filter operator | orders WHERE id > 'some-uuid' (uuid type) | rule 5 — INVALID_FILTER |
 | 47 | Access denied on column | orders columns: [internalNote] (tenant-user) | rule 4 — ACCESS_DENIED (column) |
 | 65 | Empty byIds | orders byIds=[] | rule 10 — INVALID_BY_IDS |
@@ -1170,6 +1173,16 @@ Tests are split between packages. Validation package tests run without DB connec
 | 121 | `levenshtein_lte` negative maxDistance | users WHERE lastName levenshtein_lte { text: 'x', maxDistance: -1 } | rule 5 — INVALID_VALUE (maxDistance must be ≥ 0) |
 | 122 | `in` with empty array | orders WHERE status in [] | rule 5 — INVALID_VALUE (empty array produces invalid SQL) |
 | 123 | Column filter non-existent refColumn | orders WHERE total > nonexistent (QueryColumnFilter) | rule 2 — UNKNOWN_COLUMN (refColumn side) |
+| 139 | Filter with `table` referencing non-joined table | users query, filter `{ column: 'status', table: 'orders', operator: '=' }` without joining orders | rule 5 — table 'orders' is not `from` and not in `joins` |
+| 140 | `in` with mismatched element types | orders WHERE status IN (1, 2) but status is 'string' | rule 5 — INVALID_VALUE: array elements must match column type |
+| 141 | `table` in having filter rejected | orders GROUP BY status, HAVING { column: 'totalSum', table: 'orders' } | rule 8 — `table` not allowed in `having` filters |
+| 143 | byIds with composite PK | orders byIds=[1,2] but table has composite PK [tenantId, id] | rule 10 — byIds requires single-column primary key |
+| 145 | `not_between` malformed value | orders WHERE total not_between { from: 100 } (missing `to`) | rule 5 — INVALID_VALUE (malformed compound value, same as between) |
+| 146 | `not_in` on date column | orders WHERE createdAt not_in ['2024-01-01'] | rule 5 — `not_in` rejected on `timestamp` type |
+| 150 | `in` with null element | orders WHERE status IN ('active', null) | rule 5 — INVALID_VALUE: null in `in`/`not_in` array rejected (NOT IN + NULL = 0 rows) |
+| 151 | QueryColumnFilter in HAVING group | orders GROUP BY status, HAVING group with QueryColumnFilter { column: 'totalSum', refColumn: 'avgTotal' } | rule 8 — HAVING rejects `QueryColumnFilter` (aliases, not table columns) |
+| 153 | `contains` operator in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'contains', value: '100' } | rule 8 — INVALID_HAVING: pattern operators rejected in HAVING |
+| 154 | `levenshtein_lte` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'levenshtein_lte', value: { text: '100', maxDistance: 1 } } | rule 8 — INVALID_HAVING: function operators rejected in HAVING |
 
 #### `packages/core/tests/init/` — init-time errors (ConnectionError, ProviderError)
 
@@ -1236,6 +1249,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 27 | Nested EXISTS + filter group | orders WHERE (status='active' OR EXISTS invoices) | EXISTS inside OR group |
 | 160 | Counted EXISTS | orders WHERE EXISTS invoices(count: { operator: '>=', value: 3 }) | `(SELECT COUNT(*) FROM invoices WHERE ...) >= $N` — `WhereCountedSubquery` IR |
 | 161 | Counted EXISTS with filters | orders WHERE EXISTS invoices(status='paid', count: { operator: '=', value: 2 }) | `(SELECT COUNT(*) FROM invoices WHERE ... AND status='paid') = $N` |
+| 162 | `exists` omitted (defaults true) | orders { table: 'invoices' } (no explicit `exists`) | EXISTS subquery — `exists` defaults to `true` |
 | 28 | OR filter group | orders WHERE (status='active' OR total > 100) | OR clause |
 | 29 | Negated filter group | orders WHERE NOT (status='cancelled' AND total = 0) | NOT (...) |
 | 30 | ILIKE filter | users WHERE email ILIKE '%@example%' | dialect-specific ILIKE |
@@ -1285,20 +1299,12 @@ Tests are split between packages. Validation package tests run without DB connec
 | 137 | `not_icontains` filter | users WHERE email not_icontains 'SPAM' | dialect-specific case-insensitive `NOT LIKE '%SPAM%'` |
 | 138 | Top-level filter on joined column | orders JOIN products, top-level filter: { column: 'category', table: 'products', operator: '=', value: 'electronics' } | `t1."category" = $1` in WHERE (same as QueryJoin.filters) |
 | 142 | INNER JOIN | orders INNER JOIN products | `INNER JOIN` clause (vs default LEFT) |
+| 144 | NOT in HAVING group | orders GROUP BY status, HAVING NOT (SUM(total) > 100 OR COUNT(*) > 5) | `NOT (HAVING_cond1 OR HAVING_cond2)` — negated HAVING group |
 | 147 | Multi-join with per-table filters | orders JOIN products (category='electronics') JOIN users (role='admin') | 2 JOINs + 2 WHERE conditions from joined tables |
 | 148 | Filter with `table` = `from` table | orders, filter: { column: 'status', table: 'orders', operator: '=', value: 'active' } | `t0."order_status" = $1` — explicit from-table reference, same as omitting `table` |
 | 149 | `ends_with` wildcard escaping | users WHERE email ends_with '100%off' | `LIKE '%100\%off'` — `%` in value auto-escaped |
-| 139 | Filter with `table` referencing non-joined table | users query, filter `{ column: 'status', table: 'orders', operator: '=' }` without joining orders | `ValidationError` — table 'orders' is not `from` and not in `joins` |
-| 140 | `in` with mismatched element types | orders WHERE status IN (1, 2) but status is 'string' | `ValidationError` — `INVALID_VALUE`: array elements must match column type |
-| 141 | `table` in having filter rejected | orders GROUP BY status, HAVING { column: 'totalSum', table: 'orders' } | `ValidationError` — `table` not allowed in `having` filters |
-| 143 | byIds with composite PK | orders byIds=[1,2] but table has composite PK [tenantId, id] | `ValidationError` — rule 10: byIds requires single-column primary key |
-| 144 | NOT in HAVING group | orders GROUP BY status, HAVING NOT (SUM(total) > 100 OR COUNT(*) > 5) | `NOT (HAVING_cond1 OR HAVING_cond2)` — negated HAVING group |
-| 145 | `not_between` malformed value | orders WHERE total not_between { from: 100 } (missing `to`) | `ValidationError` — `INVALID_VALUE` (malformed compound value, same as between) |
-| 146 | `not_in` on date column | orders WHERE createdAt not_in ['2024-01-01'] | `ValidationError` — rule 5: `not_in` rejected on `timestamp` type |
-| 150 | `in` with null element | orders WHERE status IN ('active', null) | `ValidationError` — `INVALID_VALUE`: null in `in`/`not_in` array rejected (NOT IN + NULL = 0 rows) |
-| 151 | QueryColumnFilter in HAVING group | orders GROUP BY status, HAVING group with QueryColumnFilter { column: 'totalSum', refColumn: 'avgTotal' } | `ValidationError` — HAVING rejects `QueryColumnFilter` (aliases, not table columns) |
-| 153 | `contains` operator in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'contains', value: '100' } | `ValidationError` — INVALID_HAVING: pattern operators rejected in HAVING |
-| 154 | `levenshtein_lte` in HAVING | orders GROUP BY status, HAVING { column: 'totalSum', operator: 'levenshtein_lte', value: { text: '100', maxDistance: 1 } } | `ValidationError` — INVALID_HAVING: function operators rejected in HAVING |
+| 163 | `distinct` + `groupBy` | orders DISTINCT, GROUP BY status, SUM(total) as totalSum | both accepted (valid SQL) — `DISTINCT` has no effect when `GROUP BY` is present |
+| 164 | SUM on all-NULL column | orders SUM(discount) as totalDiscount (all discount values are NULL) | result: `totalDiscount = null`, `meta.columns[].nullable = true` (source column is nullable) |
 
 #### `packages/core/tests/cache/` — cache strategy + masking on cached data
 
@@ -1323,7 +1329,7 @@ Tests are split between packages. Validation package tests run without DB connec
 | 61 | Hot-reload metadata | reloadMetadata() with new table added | next query sees new table |
 | 62 | Reload failure | reloadRoles() with failing provider | ProviderError, old config preserved |
 | 76 | Count + groupBy ignored | orders GROUP BY status, SUM(total) (count mode) | groupBy/aggregations/having ignored, returns scalar count |
-| 105 | close() lifecycle | call multiDb.close() | all executors + cache providers closed, subsequent queries throw |
+| 105 | close() lifecycle | call multiDb.close() | all executors + cache providers closed; subsequent queries throw `ExecutionError` (`EXECUTOR_MISSING`) — the executor is no longer available |
 
 ### Sample Column Definitions (orders table)
 
@@ -1542,6 +1548,7 @@ const roles: RoleMeta[] = [
 | Exists filters | `QueryExistsFilter` with correlated subquery, optional `count` | Leverages existing relation metadata for `EXISTS`/`NOT EXISTS`. No implicit JOIN — keeps result set clean. Access control applied to the related table. Mirrors to `WhereExists` / `WhereCountedSubquery` in `SqlParts` IR (both share `CorrelatedSubquery`). Optional `count` changes from boolean EXISTS to a counted comparison (`(SELECT COUNT(*) ...) >= N`). `count: { operator: '>=', value: 1 }` is equivalent to plain `exists: true` — prefer the simpler form. For `>=` / `>`, system may add `LIMIT N` inside the subquery to short-circuit counting |
 | Filter table qualifier | Optional `table?` on `QueryFilter` | Allows filtering on joined-table columns at top level without using `QueryJoin.filters`. Resolves ambiguity when `from` and joined tables share a column apiName |
 | Imports | Absolute paths, no `../` | Clean, refactor-friendly |
+| Column disambiguation | Qualified apiNames in result rows: `orders.id`, `products.id` when join produces collisions | Flat rows use `Record<string, unknown>` — keys must be unique. When the `from` table and a joined table share a column apiName (e.g. both have `id`), the result row qualifies colliding keys with `{tableApiName}.{columnApiName}`. Non-colliding columns keep their bare apiName. `meta.columns[].apiName` reflects the actual key used in the result row (qualified if colliding). SQL generation aliases columns via `AS "orders__id"` / `AS "products__id"` internally, then ColumnMapping translates to the qualified apiName |
 
 ---
 
@@ -1619,7 +1626,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── fixtures/
 │   │       │   └── testConfig.ts     # shared test config (metadata, roles, tables)
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
-│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 158, 159
+│   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159
 │   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
@@ -1655,7 +1662,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       ├── init/                # scenarios 53, 54, 55, 63
 │   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
-│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–162
+│   │       ├── generator/           # scenarios 20–30, 45, 66–77, 83–85, 90–94, 99–102, 108, 110–115, 124–129, 133–138, 142, 144, 147–149, 155–157, 160–164
 │   │       ├── cache/               # scenario 35
 │   │       └── e2e/                 # scenarios 14e, 31, 39, 44, 48, 58, 60–62, 76, 105, 131, 132, 152
 │   │
