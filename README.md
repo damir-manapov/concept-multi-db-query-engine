@@ -629,7 +629,7 @@ Given a query touching tables T1, T2, ... Tn:
 5. **Filter validity** — filter operators must be valid for the column type; filter groups and exists filters are validated recursively (all nested conditions checked)
 6. **Join validity** — joined tables must have a defined relation in metadata
 7. **Group By validity** — if `groupBy` or `aggregations` are present, every column in `columns` that is not an aggregation alias must appear in `groupBy`. Aggregation aliases must be unique. Prevents invalid SQL from reaching the database
-8. **Having validity** — `having` filters must reference aliases defined in `aggregations`
+8. **Having validity** — `having` filters must reference aliases defined in `aggregations`; `QueryExistsFilter` nested inside `having` groups is rejected (EXISTS in HAVING is not valid SQL)
 9. **Order By validity** — `orderBy` must reference columns from `from` table, joined tables, or aggregation aliases defined in `aggregations`
 10. **ByIds validity** — `byIds` requires a non-empty array and a single-column primary key; cannot combine with `groupBy` or `aggregations`
 11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided
@@ -1000,6 +1000,7 @@ Each scenario maps to the test directory that owns it. Some scenarios touch mult
 | 47 | Access denied on column | orders columns: [internalNote] (tenant-user) | rule 4 — ACCESS_DENIED (column) |
 | 78 | Empty columns array (no aggregations) | orders columns: [] | rule 2 — UNKNOWN_COLUMN |
 | 82 | Unknown role ID | context roles: { user: ['nonexistent'] } | rule 13 — UNKNOWN_ROLE |
+| 86 | EXISTS inside HAVING | orders HAVING group with EXISTS invoices | rule 8 — INVALID_HAVING (EXISTS not valid in HAVING) |
 
 #### `tests/access/` — role-based column trimming, masking, scope logic
 
