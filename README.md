@@ -11,7 +11,7 @@ Build a reusable, metadata-driven query engine that lets applications query data
 - Returns either **generated SQL** or **executed results** depending on the caller's needs
 - Provides **structured debug logs** for transparent pipeline tracing
 
-The package (`@mkven/multi-db`) is designed for the eng project but built as a standalone, reusable library with zero I/O dependencies in the core.
+The package (`@mkven/multi-db`) is built as a standalone, reusable library with zero I/O dependencies in the core.
 
 ## Overview
 
@@ -185,7 +185,7 @@ This ensures that an admin user making a request through a service with restrict
 ```ts
 interface RoleMeta {
   id: string                          // 'admin', 'viewer', 'orders-service'
-  tables: TableRoleAccess[]
+  tables: TableRoleAccess[] | '*'     // '*' = all tables, all columns, no masking
 }
 
 interface TableRoleAccess {
@@ -272,7 +272,13 @@ const multiDb = createMultiDb({
 
 At init time:
 - All apiNames are validated (format, reserved words, uniqueness)
-- Metadata is indexed for fast lookup
+- Metadata is indexed into in-memory Maps for O(1) lookups:
+  - `Map<apiName, TableMeta>` — table by apiName
+  - `Map<tableId, Map<apiName, ColumnMeta>>` — column by table + apiName
+  - `Map<roleId, RoleMeta>` — role by id
+  - `Map<databaseId, DatabaseMeta>` — database by id
+  - `Map<tableId, ExternalSync[]>` — syncs per table
+  - `Map<tableId, CachedTableMeta>` — cache config per table
 - Database connectivity graph is built (for planner)
 - Configuration errors are thrown immediately
 
@@ -568,20 +574,31 @@ interface ColumnMapping {
 }
 ```
 
-`SqlParts` is strictly internal — no apiNames, no masking concerns:
+`SqlParts` is strictly internal — no apiNames, no masking concerns. All column references use `ColumnRef` so each dialect controls quoting:
 
 ```ts
+// A reference to a column in a specific table — dialect handles quoting
+interface ColumnRef {
+  tableAlias: string                  // 't0'
+  columnName: string                  // 'created_at' — physical name, unquoted
+}
+
 interface SqlParts {
-  select: string[]                    // e.g. ['t0."id"', 't0."total_amount"', 't1."name"']
+  select: ColumnRef[]                 // columns to select
   from: TableRef
   joins: JoinClause[]
   where: WhereCondition[]
-  groupBy: string[]                   // e.g. ['t0."order_status"']
+  groupBy: ColumnRef[]
   having: WhereCondition[]            // filters on aggregated values
   aggregations: AggregationClause[]
-  orderBy: string[]                   // e.g. ['t0."created_at" DESC']
+  orderBy: OrderByClause[]
   limit?: number
   offset?: number
+}
+
+interface OrderByClause {
+  column: ColumnRef
+  direction: 'asc' | 'desc'
 }
 
 interface TableRef {
@@ -593,11 +610,12 @@ interface TableRef {
 interface JoinClause {
   type: 'inner' | 'left'
   table: TableRef
-  on: string                          // 't0."customer_id" = t1."id"'
+  leftColumn: ColumnRef               // e.g. { tableAlias: 't0', columnName: 'customer_id' }
+  rightColumn: ColumnRef              // e.g. { tableAlias: 't1', columnName: 'id' }
 }
 
 interface WhereCondition {
-  expression: string                  // 't0."order_status"'
+  column: ColumnRef
   operator: string                    // '='
   paramIndex?: number                 // for parameterized values
   literal?: string                    // for IS NULL, IS NOT NULL
@@ -605,12 +623,17 @@ interface WhereCondition {
 
 interface AggregationClause {
   fn: 'count' | 'sum' | 'avg' | 'min' | 'max'
-  expression: string                  // 't0."total_amount"'
-  alias: string                       // result column name (apiName for the aggregation)
+  column: ColumnRef
+  alias: string                       // result column name
 }
 ```
 
-Each `SqlDialect` takes a `SqlParts` and produces `{ sql: string, params: unknown[] }` with correct identifier quoting, parameter binding syntax, and engine-specific functions. No external SQL generation packages are used — the query shape is predictable (SELECT with optional WHERE/JOIN/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET) and each dialect is ~200–300 lines.
+Each `SqlDialect` takes a `SqlParts` and produces `{ sql: string, params: unknown[] }`. The dialect resolves each `ColumnRef` with its own quoting rules:
+- Postgres: `t0."created_at"`
+- ClickHouse: `` t0.`created_at` ``
+- Trino: `t0."created_at"`
+
+No external SQL generation packages are used — the query shape is predictable (SELECT with optional WHERE/JOIN/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET) and each dialect is ~200–300 lines.
 
 ---
 
@@ -815,16 +838,7 @@ const eventsRelations: RelationMeta[] = [
 const roles: RoleMeta[] = [
   {
     id: 'admin',
-    tables: [
-      { tableId: 'users',    allowedColumns: '*' },
-      { tableId: 'orders',   allowedColumns: '*' },
-      { tableId: 'products', allowedColumns: '*' },
-      { tableId: 'tenants',  allowedColumns: '*' },
-      { tableId: 'invoices', allowedColumns: '*' },
-      { tableId: 'events',   allowedColumns: '*' },
-      { tableId: 'metrics',  allowedColumns: '*' },
-      { tableId: 'orders-archive', allowedColumns: '*' },
-    ],
+    tables: '*',
   },
   {
     id: 'tenant-user',
@@ -864,16 +878,7 @@ const roles: RoleMeta[] = [
   },
   {
     id: 'full-service',
-    tables: [
-      { tableId: 'users',    allowedColumns: '*' },
-      { tableId: 'orders',   allowedColumns: '*' },
-      { tableId: 'products', allowedColumns: '*' },
-      { tableId: 'tenants',  allowedColumns: '*' },
-      { tableId: 'invoices', allowedColumns: '*' },
-      { tableId: 'events',   allowedColumns: '*' },
-      { tableId: 'metrics',  allowedColumns: '*' },
-      { tableId: 'orders-archive', allowedColumns: '*' },
-    ],
+    tables: '*',
   },
 ]
 ```
