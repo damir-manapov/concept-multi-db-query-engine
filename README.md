@@ -1318,11 +1318,27 @@ const roles: RoleMeta[] = [
 
 | Package | Purpose | Dependencies |
 |---|---|---|
-| `@mkven/multi-db` | Core: types, metadata registry, validation, planner, SQL generators | **zero** I/O deps |
+| `@mkven/multi-db-validation` | Types, error classes, config validation, query validation (rules 1–14), apiName validation | **zero** I/O deps |
+| `@mkven/multi-db` | Core: metadata registry, planner, SQL generators, name resolution, masking, debug logger | `@mkven/multi-db-validation` |
 | `@mkven/multi-db-executor-postgres` | Postgres connection + execution | `pg` |
 | `@mkven/multi-db-executor-clickhouse` | ClickHouse connection + execution | `@clickhouse/client` |
 | `@mkven/multi-db-executor-trino` | Trino connection + execution | `trino-client` |
 | `@mkven/multi-db-cache-redis` | Redis cache provider (Debezium-synced) | `ioredis` |
+
+`@mkven/multi-db-validation` is the **client-side** package — it contains all types, error classes, and validation logic. Clients can validate configs and queries locally before sending to the server, failing fast without pulling in planner/SQL generators. The core package depends on it and re-exports its types.
+
+```ts
+import { validateQuery, validateConfig, validateApiName } from '@mkven/multi-db-validation'
+import type { QueryDefinition, MetadataConfig, ExecutionContext } from '@mkven/multi-db-validation'
+
+// At config time — validate metadata before shipping to server
+const configErrors = validateConfig(metadata)       // returns ConfigError | null
+
+// At query time — validate query before sending
+const queryErrors = validateQuery(definition, context, metadata, roles)  // returns ValidationError | null
+```
+
+Both `validateConfig()` and `validateQuery()` return `null` on success, or the corresponding error object (not thrown) so the caller can decide how to handle it. The core package still throws these errors internally.
 
 Core has **zero I/O dependencies** — usable for SQL-only mode without any DB drivers. Each executor is a thin adapter that consumers install only if needed.
 
@@ -1340,23 +1356,30 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 ├── README.md
 │
 ├── packages/
+│   ├── validation/                  # @mkven/multi-db-validation
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   └── src/
+│   │       ├── index.ts             # public API: validateQuery, validateConfig, validateApiName + re-exports
+│   │       ├── errors.ts            # MultiDbError hierarchy (ConfigError, ValidationError, etc.)
+│   │       ├── types/
+│   │       │   ├── metadata.ts      # DatabaseMeta, TableMeta, ColumnMeta, RelationMeta, ExternalSync, CacheMeta, RoleMeta
+│   │       │   ├── query.ts         # QueryDefinition, QueryFilter, QueryJoin, QueryAggregation, etc.
+│   │       │   ├── result.ts        # QueryResult, QueryResultMeta, DebugLogEntry
+│   │       │   └── context.ts       # ExecutionContext
+│   │       └── validation/
+│   │           ├── configValidator.ts   # validateConfig — apiName format, uniqueness, references, relations, syncs, caches
+│   │           ├── queryValidator.ts    # validateQuery — rules 1–14 against metadata + roles
+│   │           └── rules.ts             # per-rule validation logic (table, column, filter, join, etc.)
+│   │
 │   ├── core/                        # @mkven/multi-db
 │   │   ├── package.json
 │   │   ├── tsconfig.json
 │   │   └── src/
-│   │       ├── index.ts             # public API
-│   │       ├── errors.ts            # MultiDbError hierarchy (ConfigError, ConnectionError, etc.)
-│   │       ├── types/
-│   │       │   ├── metadata.ts      # DatabaseMeta, TableMeta, ColumnMeta, etc.
-│   │       │   ├── query.ts         # QueryDefinition, QueryFilter, QueryJoin, QueryAggregation
-│   │       │   ├── result.ts        # QueryResult, QueryResultMeta, DebugLogEntry
-│   │       │   └── context.ts       # ExecutionContext
+│   │       ├── index.ts             # public API (re-exports types + errors from validation package)
 │   │       ├── metadata/
 │   │       │   ├── registry.ts      # MetadataRegistry — stores and indexes all metadata
 │   │       │   └── providers.ts     # MetadataProvider / RoleProvider interfaces + static helpers
-│   │       ├── validation/
-│   │       │   ├── validator.ts     # query validation against metadata + role
-│   │       │   └── rules.ts         # per-rule validation logic (table, column, filter, join, etc.)
 │   │       ├── access/
 │   │       │   └── access.ts        # role-based column trimming
 │   │       ├── masking/
