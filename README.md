@@ -1151,6 +1151,8 @@ const roles: RoleMeta[] = [
 
 Core has **zero I/O dependencies** — usable for SQL-only mode without any DB drivers. Each executor is a thin adapter that consumers install only if needed.
 
+---
+
 ## Project Structure
 
 ```
@@ -1179,7 +1181,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 │   │       │   └── providers.ts     # MetadataProvider / RoleProvider interfaces + static helpers
 │   │       ├── validation/
 │   │       │   ├── validator.ts     # query validation against metadata + role
-│   │       │   └── errors.ts        # typed validation errors
+│   │       │   └── rules.ts         # per-rule validation logic (table, column, filter, join, etc.)
 │   │       ├── access/
 │   │       │   └── access.ts        # role-based column trimming
 │   │       ├── masking/
