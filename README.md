@@ -595,8 +595,9 @@ Given a query touching tables T1, T2, ... Tn:
 8. **Having validity** — `having` filters must reference aliases defined in `aggregations`
 9. **Order By validity** — `orderBy` must reference columns from `from` table or joined tables
 10. **ByIds validity** — `byIds` requires a single-column primary key; cannot combine with `groupBy` or `aggregations`
+11. **Limit/Offset validity** — `limit` and `offset` must be non-negative integers when provided
 
-All validation errors are descriptive and include what was expected vs what was provided.
+All validation errors are **collected, not thrown one at a time**. The system runs all applicable checks and throws a single `ValidationError` containing every issue found. This lets callers fix all problems at once instead of playing whack-a-mole.
 
 ---
 
@@ -615,8 +616,12 @@ class ConfigError extends MultiDbError {
 }
 
 class ValidationError extends MultiDbError {
-  code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_GROUP_BY' | 'INVALID_HAVING' | 'INVALID_ORDER_BY' | 'INVALID_BY_IDS'
-  details: { expected?: string; actual?: string; table?: string; column?: string; role?: string }
+  code: 'VALIDATION_FAILED'           // always this code — individual issues are in `errors`
+  errors: {
+    code: 'UNKNOWN_TABLE' | 'UNKNOWN_COLUMN' | 'ACCESS_DENIED' | 'INVALID_FILTER' | 'INVALID_JOIN' | 'INVALID_GROUP_BY' | 'INVALID_HAVING' | 'INVALID_ORDER_BY' | 'INVALID_BY_IDS' | 'INVALID_LIMIT'
+    message: string
+    details: { expected?: string; actual?: string; table?: string; column?: string; role?: string }
+  }[]
 }
 
 class PlannerError extends MultiDbError {
@@ -626,11 +631,16 @@ class PlannerError extends MultiDbError {
 
 class ExecutionError extends MultiDbError {
   code: 'EXECUTOR_MISSING' | 'CACHE_PROVIDER_MISSING' | 'QUERY_FAILED'
-  details: { database?: string; originalError?: Error }
+  details: { database?: string; sql?: string; params?: unknown[]; originalError?: Error }
+}
+
+class ProviderError extends MultiDbError {
+  code: 'METADATA_LOAD_FAILED' | 'ROLE_LOAD_FAILED'
+  details: { provider: 'metadata' | 'role'; originalError?: Error }
 }
 ```
 
-`ConfigError` is thrown at init time (invalid apiNames, duplicate names, broken DB/table/relation references). `ValidationError` is thrown per query. `PlannerError` is thrown when no execution strategy can satisfy the query. `ExecutionError` is thrown during SQL execution or cache access.
+`ConfigError` is thrown at init time (invalid apiNames, duplicate names, broken DB/table/relation references). `ValidationError` is thrown per query — it collects **all** validation issues into a single error with an `errors[]` array, so callers can see every problem at once. `PlannerError` is thrown when no execution strategy can satisfy the query. `ExecutionError` is thrown during SQL execution or cache access — for `QUERY_FAILED`, the `sql` and `params` that caused the failure are included for debugging. `ProviderError` is thrown when `MetadataProvider.load()` or `RoleProvider.load()` fails (wraps the original error).
 
 ---
 
