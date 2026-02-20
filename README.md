@@ -988,6 +988,93 @@ Roles have no `scope` field — the same role can be used in any scope via `Exec
 | 47 | Access denied on column | orders columns: [internalNote] (tenant-user) | validation error: ACCESS_DENIED |
 | 48 | Cache provider missing | users byIds=[1] (no redis provider registered) | ExecutionError: CACHE_PROVIDER_MISSING |
 
+### Test Scenarios by Package
+
+Each scenario maps to the test directory that owns it. Some scenarios touch multiple phases but are assigned to their **primary concern**.
+
+#### `tests/validation/` — input validation against metadata + roles
+
+| # | Scenario | Rule |
+|---|---|---|
+| 15 | No-access role | rule 3 — ACCESS_DENIED (table) |
+| 17 | Invalid table name | rule 1 — UNKNOWN_TABLE |
+| 18 | Invalid column name | rule 2 — UNKNOWN_COLUMN |
+| 32 | Invalid join (no relation) | rule 6 — INVALID_JOIN |
+| 34 | Multiple validation errors | multi-error collection |
+| 36 | Invalid limit/offset | rule 11 — INVALID_LIMIT |
+| 37 | byIds + aggregations | rule 10 — INVALID_BY_IDS |
+| 40 | Invalid GROUP BY | rule 7 — INVALID_GROUP_BY |
+| 41 | Invalid HAVING | rule 8 — INVALID_HAVING |
+| 42 | Invalid ORDER BY | rule 9 — INVALID_ORDER_BY |
+| 43 | Invalid EXISTS filter | rule 12 — INVALID_EXISTS |
+| 46 | Invalid filter operator | rule 5 — INVALID_FILTER |
+| 47 | Access denied on column | rule 4 — ACCESS_DENIED (column) |
+
+#### `tests/access/` — role-based column trimming, masking, scope logic
+
+| # | Scenario | Focus |
+|---|---|---|
+| 13 | Admin role | all columns visible |
+| 14 | Tenant-user role | subset columns only |
+| 14b | Column masking | masking applied per role |
+| 14c | Multi-role within scope | union within scope |
+| 14d | Cross-scope restriction | intersection between scopes |
+| 14f | Omitted scope | no restriction from missing scope |
+| 16 | Column trimming on byIds | role intersection with byIds columns |
+| 38 | Columns omitted | undefined columns → all allowed for role |
+
+#### `tests/planner/` — strategy selection (P0–P4)
+
+| # | Scenario | Strategy |
+|---|---|---|
+| 1 | Single PG table | P1 — direct |
+| 2 | Join within same PG | P1 — direct |
+| 3 | Cross-PG, debezium available | P2 — materialized |
+| 4 | Cross-PG, no debezium | P3 — trino |
+| 5 | PG + CH, debezium available | P2 — materialized |
+| 6 | PG + CH, no debezium | P3 — trino |
+| 7 | PG + Iceberg | P3 or P2 |
+| 8 | By-ID with cache hit | P0 — cache |
+| 9 | By-ID cache miss | P1 — direct |
+| 10 | By-ID partial cache | P0 + P1 — cache + direct merge |
+| 11 | Freshness=realtime | skip P2, use P3 |
+| 12 | Freshness=hours | P2 — materialized |
+| 19 | Trino disabled | P4 — error |
+| 33 | byIds + filters (cache skip) | P0 skipped → P1 |
+
+#### `tests/generator/` — SQL generation per dialect
+
+| # | Scenario | SQL Feature |
+|---|---|---|
+| 20 | Aggregation query | GROUP BY + SUM |
+| 21 | Aggregation + join | cross-table GROUP BY |
+| 22 | HAVING clause | HAVING with aggregate |
+| 23 | DISTINCT query | SELECT DISTINCT |
+| 24 | Cross-table ORDER BY | qualified ORDER BY |
+| 25 | EXISTS filter | EXISTS subquery |
+| 26 | NOT EXISTS filter | NOT EXISTS subquery |
+| 27 | Nested EXISTS + filter group | EXISTS inside OR group |
+| 28 | OR filter group | OR clause |
+| 29 | Negated filter group | NOT (...) |
+| 30 | ILIKE filter | dialect-specific ILIKE |
+| 45 | is_null filter | IS NULL |
+
+#### `tests/cache/` — cache strategy + masking on cached data
+
+| # | Scenario | Focus |
+|---|---|---|
+| 35 | Masking on cached results | cache hit + masking applied |
+
+#### `tests/e2e/` — full pipeline integration
+
+| # | Scenario | Focus |
+|---|---|---|
+| 14e | Count mode | executeMode: 'count' |
+| 31 | SQL-only mode | executeMode: 'sql-only' |
+| 39 | Debug mode | debug: true → debugLog |
+| 44 | Executor missing | EXECUTOR_MISSING at execution |
+| 48 | Cache provider missing | CACHE_PROVIDER_MISSING at execution |
+
 ### Sample Column Definitions (orders table)
 
 ```ts
