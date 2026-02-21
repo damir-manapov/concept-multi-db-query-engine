@@ -1,4 +1,4 @@
-# @mkven/multi-db — Concept Document
+# @mkven/multi-db-query — Concept Document
 
 ## Objective
 
@@ -15,7 +15,7 @@ Build a reusable, metadata-driven query engine that lets applications query, fil
 - Provides **structured debug logs** for transparent pipeline tracing
 - Supports **hot-reload** of metadata and roles, **health checks** for all providers, and graceful **shutdown**
 
-The monorepo ships a standalone **validation package** (`@mkven/multi-db-validation`) with **zero I/O dependencies** — clients can validate configs and queries locally before sending to the server. The core package (`@mkven/multi-db`) depends on it and adds planning, SQL generation, and masking, also with zero I/O deps. An **HTTP client package** (`@mkven/multi-db-client`) provides a typed client and a contract test suite — the same tests run against both in-process and HTTP implementations. Database drivers and cache clients live in separate executor/cache packages.
+The monorepo ships a standalone **validation package** (`@mkven/multi-db-validation`) with **zero I/O dependencies** — clients can validate configs and queries locally before sending to the server. The core package (`@mkven/multi-db-query`) depends on it and adds planning, SQL generation, and masking, also with zero I/O deps. An **HTTP client package** (`@mkven/multi-db-client`) provides a typed client and a contract test suite — the same tests run against both in-process and HTTP implementations. Database drivers and cache clients live in separate executor/cache packages.
 
 ## Target Databases
 
@@ -247,7 +247,7 @@ interface RoleProvider {
 For static configs (tests, simple apps), use the built-in helpers:
 
 ```ts
-import { staticMetadata, staticRoles } from '@mkven/multi-db'
+import { staticMetadata, staticRoles } from '@mkven/multi-db-query'
 
 const metadataProvider = staticMetadata({ databases: [...], tables: [...], ... })
 const roleProvider = staticRoles([...])
@@ -328,7 +328,7 @@ interface CacheProvider {
 The module is initialized with metadata and role providers, plus optional executor/cache instances:
 
 ```ts
-import { createMultiDb, staticMetadata, staticRoles } from '@mkven/multi-db'
+import { createMultiDb, staticMetadata, staticRoles } from '@mkven/multi-db-query'
 import { createPostgresExecutor } from '@mkven/multi-db-executor-postgres'
 import { createClickHouseExecutor } from '@mkven/multi-db-executor-clickhouse'
 import { createTrinoExecutor } from '@mkven/multi-db-executor-trino'
@@ -1719,7 +1719,7 @@ const roles: RoleMeta[] = [
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Package name | `@mkven/multi-db` | Org-scoped, reusable |
+| Package name | `@mkven/multi-db-query` | Org-scoped, reusable |
 | Language | TypeScript | Type-safe, wide ecosystem |
 | Query format | Typed object literals | Type-safe, IDE support, no parser |
 | Metadata source | Provider-based (always). Static helpers `staticMetadata()` / `staticRoles()` for simple cases | Uniform API — `reload` always works; no static/dynamic split |
@@ -1752,7 +1752,7 @@ const roles: RoleMeta[] = [
 | Package | Purpose | Dependencies |
 |---|---|---|
 | `@mkven/multi-db-validation` | Types, error classes, config validation, query validation (rules 1–14), apiName validation | **zero** I/O deps |
-| `@mkven/multi-db` | Core: metadata registry, planner, SQL generators, name resolution, masking, debug logger | `@mkven/multi-db-validation` |
+| `@mkven/multi-db-query` | Core: metadata registry, planner, SQL generators, name resolution, masking, debug logger | `@mkven/multi-db-validation` |
 | `@mkven/multi-db-executor-postgres` | Postgres connection + execution | `pg` |
 | `@mkven/multi-db-executor-clickhouse` | ClickHouse connection + execution | `@clickhouse/client` |
 | `@mkven/multi-db-executor-trino` | Trino connection + execution | `trino-client` |
@@ -1798,7 +1798,7 @@ Core has **zero I/O dependencies** — usable for SQL-only mode without any DB d
 
 ### HTTP API Contract
 
-The system defines a minimal HTTP API contract that any server wrapping `@mkven/multi-db` must implement:
+The system defines a minimal HTTP API contract that any server wrapping `@mkven/multi-db-query` must implement:
 
 | Endpoint | Method | Request Body | Response Body |
 |---|---|---|---|
@@ -1976,7 +1976,7 @@ This ensures both implementations behave identically — same results, same erro
 │   │       ├── config/              # scenarios 49–52, 80, 81, 89, 96
 │   │       └── query/               # scenarios 15, 17, 18, 32, 34, 36, 37, 40–43, 46, 47, 65, 78, 82, 86–88, 97, 98, 107, 109, 116–123, 139–141, 143, 145, 146, 150, 151, 153, 154, 157–159, 165, 167–169, 173–180, 187, 190–192, 195, 198, 199, 229–232, 234, 235
 │   │
-│   ├── core/                        # @mkven/multi-db
+│   ├── core/                        # @mkven/multi-db-query
 │   │   ├── package.json
 │   │   ├── tsconfig.json
 │   │   └── src/
