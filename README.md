@@ -103,7 +103,7 @@ interface DatabaseMeta {
 
 ```ts
 interface TableMeta {
-  id: string                          // logical table id: 'orders'
+  id: string                          // logical table id: 'orders', 'orders-archive' — free-form (may contain hyphens), unlike apiName which follows camelCase rules
   apiName: string                     // exposed to API consumers: 'orders'
   database: string                    // references DatabaseMeta.id
   physicalName: string                // actual table name in DB: 'public.orders'
@@ -137,7 +137,7 @@ Relations are defined on the table that holds the FK column. When resolving join
 ```ts
 interface RelationMeta {
   column: string                      // apiName of FK column in this table
-  references: { table: string; column: string }  // apiName references
+  references: { table: string; column: string }  // table by id, column by apiName
   type: 'many-to-one' | 'one-to-many' | 'one-to-one'
 }
 ```
@@ -657,7 +657,7 @@ Given a query touching tables T1, T2, ... Tn:
 - If partial hit → return cached + fetch missing from DB, merge
 
 ### Priority 1 — Single Database Direct
-- ALL required tables exist in ONE database (original data)
+- ALL required tables exist in ONE database (original data). "Required" includes `from`, all `joins`, and any tables referenced by `QueryExistsFilter` (recursively — EXISTS inside filter groups or nested EXISTS are walked)
 - Generate native SQL for that engine
 - **Iceberg exception:** Iceberg databases have no standalone executor — they are always queried via the `trino` executor using `trinoCatalog`. A single-Iceberg-table P1 query routes through the Trino executor with Trino dialect (single-catalog, no cross-DB federation)
 - This is always preferred when possible (freshest data, no overhead)
@@ -668,10 +668,12 @@ Given a query touching tables T1, T2, ... Tn:
 - Freshness hierarchy (strictest to most relaxed): `realtime` < `seconds` < `minutes` < `hours`. `realtime` is query-only (never an `estimatedLag` value) — it means direct access required. A replica is acceptable when its `estimatedLag` ≤ the query's `freshness` tolerance
 - Always prefer the **original** database if the original data is there; use replicas for the "foreign" tables
 - If multiple databases could serve via replicas, prefer the one with the most original tables
+- Post-resolution, physical table names in `SqlParts` are replaced with the materialized replica names — applies to `from`, `joins`, and `CorrelatedSubquery.from` inside EXISTS subqueries in the WHERE tree
 
 ### Priority 3 — Trino Cross-Database
 - Trino is enabled and all databases are registered as trino catalogs
 - Generate Trino SQL with cross-catalog references
+- Post-resolution, catalog qualifiers are set on all `TableRef` nodes — `from`, `joins`, and `CorrelatedSubquery.from` inside EXISTS subqueries in the WHERE tree
 - Fallback when no single-DB path exists
 
 ### Priority 4 — Error
@@ -875,8 +877,8 @@ This decouples the API contract from database schema evolution.
 | `startsWith` / `endsWith` | `LIKE 'x%'` / `LIKE '%x'` | `startsWith(col, {p1})` / `endsWith(col, {p2})` | `LIKE 'x%'` / `LIKE '%x'` |
 | `istartsWith` / `iendsWith` | `ILIKE 'x%'` / `ILIKE '%x'` | `ilike(col, 'x%')` / `ilike(col, '%x')` | `lower(col) LIKE lower('x%')` / `lower(col) LIKE lower('%x')` |
 | Levenshtein distance | `levenshtein(col, $1) <= $2` | `editDistance(col, {p1:String}) <= {p2:UInt32}` | `levenshtein_distance(col, ?) <= ?` |
-| BETWEEN | `col BETWEEN $1 AND $2` | `col BETWEEN {p1} AND {p2}` | `col BETWEEN ? AND ?` |
-| NOT BETWEEN | `col NOT BETWEEN $1 AND $2` | `NOT (col BETWEEN {p1} AND {p2})` | `col NOT BETWEEN ? AND ?` |
+| BETWEEN | `col BETWEEN $1 AND $2` | `col BETWEEN {p1:Type} AND {p2:Type}` | `col BETWEEN ? AND ?` |
+| NOT BETWEEN | `col NOT BETWEEN $1 AND $2` | `NOT (col BETWEEN {p1:Type} AND {p2:Type})` | `col NOT BETWEEN ? AND ?` |
 | Boolean | `true/false` | `1/0` | `true/false` |
 | Counted subquery | `(SELECT COUNT(*) FROM ... WHERE ...) >= $N` | `(SELECT COUNT(*) FROM ... WHERE ...) >= {pN:UInt64}` | `(SELECT COUNT(*) FROM ... WHERE ...) >= ?` |
 | Array column type | `text[]`, `integer[]`, etc. | `Array(String)`, `Array(Int32)`, etc. | `array(varchar)`, `array(integer)`, etc. |
@@ -899,7 +901,7 @@ This decouples the API contract from database schema evolution.
 
 Only types that support `in`/`notIn` are listed (`boolean`, `date`, `timestamp` are rejected by rule 5). ClickHouse and Trino expand values inline and don't need type casts.
 
-**ClickHouse parameter type mapping:** ClickHouse uses named typed parameters (`{p1:Type}`) for parameterized queries. The system maps `ColumnType` → ClickHouse type:
+**ClickHouse typed parameters:** Every ClickHouse parameter requires a type annotation (`{p1:String}`, `{p2:Int32}`, etc.). When `columnType` is available (from `WhereCondition.columnType` or `WhereArrayCondition.elementType`), the dialect maps `ColumnType` → ClickHouse type:
 
 | ColumnType | ClickHouse Type | Example |
 |---|---|---|
@@ -911,7 +913,7 @@ Only types that support `in`/`notIn` are listed (`boolean`, `date`, `timestamp` 
 | `date` | `Date` | `{p1:Date}` |
 | `timestamp` | `DateTime` | `{p1:DateTime}` |
 
-Array element types use the same mapping — e.g. `has(col, {p1:String})` for `arrayContains` on `'string[]'`. `in`/`notIn` expand inline as `IN tuple(...)` and don't use typed parameters for the values.
+Array element types use the same mapping — e.g. `has(col, {p1:String})` for `arrayContains` on `'string[]'`. `in`/`notIn` expand inline as `IN tuple(...)` with each value typed individually. When no `columnType` is available, the dialect infers the type from the JS runtime value (string → `String`, integer → `Int32`, float → `Float64`, boolean → `Bool`). Some contexts use hardcoded types: `UInt64` for counted subquery comparison values, `UInt32` for levenshtein distance thresholds. The `Type` placeholder in the dialect table above denotes a type resolved at generation time.
 
 **Postgres array operator type mapping:** `arrayContainsAll` (`@>`) and `arrayContainsAny` (`&&`) use the same type casts as `in`/`notIn` — e.g. `col @> $1::text[]`. `arrayContains` (`= ANY`) uses the scalar type cast — e.g. `$1::text = ANY(col)`. ClickHouse and Trino use function-based syntax and don't need casts.
 
@@ -922,14 +924,16 @@ Each engine gets a `SqlDialect` implementation.
 SQL generation uses an intermediate `SqlParts` representation that is **internal** and dialect-agnostic. It operates entirely in physical names — no apiNames. The pipeline is:
 
 ```
-QueryDefinition → (planner + access control) → name resolution → SqlParts → SqlDialect → { sql, params }
-                                                     ↓
-                                              ColumnMapping[] (for result mapping)
+QueryDefinition → (planner + access control) → name resolution → ResolveResult → SqlDialect.generate(parts, params) → { sql, params }
+                                                                       ↓
+                                        { parts: SqlParts, params: unknown[], columnMappings: ColumnMapping[], mode }
 ```
 
-Name resolution produces two outputs:
+Name resolution produces a `ResolveResult` containing:
 1. `SqlParts` — purely physical names, used for SQL generation
-2. `ColumnMapping[]` — the mapping table used to rename result columns back to apiNames
+2. `params: unknown[]` — ordered parameter values matching `SqlParts` param indexes
+3. `ColumnMapping[]` — the mapping table used to rename result columns back to apiNames
+4. `mode` — `'data'` for normal queries, `'count'` when `countMode` was requested
 
 ```ts
 // Built during name resolution, used after execution to map results back
@@ -940,7 +944,19 @@ interface ColumnMapping {
   masked: boolean                     // apply masking after fetch (always false for aggregation aliases)
   type: ColumnType                    // logical column type; for aggregations: inferred from fn (count → 'int', avg → always 'decimal', sum/min/max → source column type)
   maskingFn?: 'email' | 'phone' | 'name' | 'uuid' | 'number' | 'date' | 'full'
-                                      // which masking function to apply (from ColumnMeta)
+                                      // which masking function to apply — sourced from effective access resolution
+                                      // (defaults to 'full' when column is masked but ColumnMeta has no maskingFn)
+}
+```
+
+The resolver's full output is captured in `ResolveResult`:
+
+```ts
+interface ResolveResult {
+  parts: SqlParts                     // physical-name SQL parts — fed to dialect
+  params: unknown[]                   // ordered parameter values matching SqlParts param indexes
+  columnMappings: ColumnMapping[]     // apiName ↔ physicalName mapping for result rows
+  mode: 'data' | 'count'             // 'data' for normal queries; 'count' when countMode is requested
 }
 ```
 
@@ -965,6 +981,7 @@ interface SqlParts {
   orderBy: OrderByClause[]
   limit?: number
   offset?: number
+  countMode?: boolean                 // when true, dialect emits SELECT COUNT(*) instead of regular SELECT
 }
 
 // Recursive WHERE tree — mirrors QueryFilterGroup at the physical level
@@ -983,8 +1000,8 @@ interface WhereFunction {
 interface WhereArrayCondition {
   column: ColumnRef
   operator: 'contains' | 'containsAll' | 'containsAny' | 'isEmpty' | 'isNotEmpty'
-  paramIndexes?: number[]             // contains: single index; containsAll/containsAny: one index per element; omit for isEmpty/isNotEmpty
-  elementType: string                 // SQL element type for Postgres casting (e.g. 'text', 'integer'); ClickHouse/Trino don't use it
+  paramIndexes?: number[]             // contains: single index; containsAll/containsAny: single index pointing to an array value (dialects expand per-element as needed); omit for isEmpty/isNotEmpty
+  elementType: string                 // logical element type (e.g. 'string', 'int') — each dialect maps to SQL type (Postgres array casts, ClickHouse typed params, Trino inline expansion)
 }
 
 // HAVING tree — same as WhereNode but excludes EXISTS, WhereColumnCondition, WhereFunction, and WhereArrayCondition
@@ -1033,6 +1050,10 @@ interface WhereCountedSubquery {
   // For >= / > operators, system may add LIMIT inside subquery to short-circuit counting
 }
 
+// Subquery table aliases use a separate prefix `s` and continue the shared alias counter.
+// If the outer query uses t0 and t1 (a join), the correlated subquery's table gets s2.
+// This avoids alias collisions when the same physical table appears in both contexts.
+
 interface OrderByClause {
   column: ColumnRef | string           // ColumnRef for table columns; bare string for aggregation aliases (e.g. 'totalSum')
   direction: 'asc' | 'desc'
@@ -1060,6 +1081,7 @@ interface WhereCondition {
   operator: string                    // '=', 'ILIKE', 'ANY', etc. — string (not union) because dialects may emit operators beyond the public QueryFilter set
   paramIndex?: number                 // for parameterized values (mutually exclusive with `literal`)
   literal?: string                    // for IS NULL, IS NOT NULL (mutually exclusive with `paramIndex`)
+  columnType?: string                 // logical column type (e.g. 'string', 'int', 'uuid') — needed for type-specific SQL (ClickHouse typed params, Postgres IN/NOT IN array casts)
 }
 
 // Column-vs-column condition — no parameters, both sides are column references
@@ -1086,11 +1108,11 @@ interface AggregationClause {
 
 ```ts
 interface SqlDialect {
-  generate(parts: SqlParts): { sql: string; params: unknown[] }
+  generate(parts: SqlParts, params: unknown[]): { sql: string; params: unknown[] }
 }
 ```
 
-Each `SqlDialect` takes a `SqlParts` and produces `{ sql: string, params: unknown[] }`. The dialect resolves each `ColumnRef` with its own quoting rules:
+Each `SqlDialect` takes a `SqlParts` and the resolver's collected parameter array, and produces `{ sql: string, params: unknown[] }`. The dialect reads values from the incoming `params` array by index (using `paramIndex`, `fromParamIndex`, etc. from `SqlParts` nodes) and emits dialect-specific placeholders (`$1`, `{p1:Type}`, `?`). The dialect resolves each `ColumnRef` with its own quoting rules:
 - Postgres: `t0."created_at"`
 - ClickHouse: `` t0.`created_at` ``
 - Trino: `t0."created_at"`
@@ -1511,6 +1533,7 @@ const usersColumns: ColumnMeta[] = [
   { apiName: 'firstName', physicalName: 'first_name',  type: 'string',    nullable: false, maskingFn: 'name' },
   { apiName: 'lastName',  physicalName: 'last_name',   type: 'string',    nullable: false, maskingFn: 'name' },
   { apiName: 'role',      physicalName: 'role',        type: 'string',    nullable: false },
+  { apiName: 'age',       physicalName: 'age',         type: 'int',       nullable: true },
   { apiName: 'tenantId',  physicalName: 'tenant_id',   type: 'uuid',      nullable: false },
   { apiName: 'createdAt', physicalName: 'created_at',  type: 'timestamp', nullable: false },
 ]
@@ -1704,7 +1727,7 @@ const roles: RoleMeta[] = [
 | Exists filters | `QueryExistsFilter` with correlated subquery, optional `count` | Leverages existing relation metadata for `EXISTS`/`NOT EXISTS`. No implicit JOIN — keeps result set clean. Access control applied to the related table. Mirrors to `WhereExists` / `WhereCountedSubquery` in `SqlParts` IR (both share `CorrelatedSubquery`). Optional `count` changes from boolean EXISTS to a counted comparison (`(SELECT COUNT(*) ...) >= N`). `count: { operator: '>=', value: 1 }` is equivalent to plain `exists: true` — prefer the simpler form. For `>=` / `>`, system may add `LIMIT N` inside the subquery to short-circuit counting |
 | Filter table qualifier | Optional `table?` on `QueryFilter` | Allows filtering on joined-table columns at top level without using `QueryJoin.filters`. Resolves ambiguity when `from` and joined tables share a column apiName |
 | Imports | Absolute paths, no `../` | Clean, refactor-friendly |
-| Column disambiguation | Qualified apiNames in result rows: `orders.id`, `products.id` when join produces collisions | Flat rows use `Record<string, unknown>` — keys must be unique. When the `from` table and a joined table share a column apiName (e.g. both have `id`), the result row qualifies colliding keys with `{tableApiName}.{columnApiName}`. Non-colliding columns keep their bare apiName. `meta.columns[].apiName` reflects the actual key used in the result row (qualified if colliding). SQL generation aliases columns via `AS "orders__id"` / `AS "products__id"` internally, then ColumnMapping translates to the qualified apiName |
+| Column disambiguation | Qualified apiNames in result rows: `orders.id`, `products.id` when join produces collisions | Flat rows use `Record<string, unknown>` — keys must be unique. When the `from` table and a joined table share a column apiName (e.g. both have `id`), the result row qualifies colliding keys with `{tableApiName}.{columnApiName}`. Non-colliding columns keep their bare apiName. `meta.columns[].apiName` reflects the actual key used in the result row (qualified if colliding). SQL generation aliases columns via `AS "{tableAlias}__{physicalName}"` internally (e.g. `AS "t0__total_amount"`), then the pipeline's `remapRows()` step uses `ColumnMapping[]` to translate those internal aliases to the final apiName keys (`total`, or `orders.id` / `products.id` when colliding) |
 | Executor timeout | Per-executor `timeoutMs` in factory config, no global default | Each DB has different performance profiles — Postgres: 30s, ClickHouse: 60s, Trino: 120s. Driver-level enforcement (`statement_timeout`, `max_execution_time`) is more reliable than `Promise.race` |
 | Concurrent safety | `query()` uses snapshot of metadata/roles; `reload*()` atomically swaps references | No locking needed — immutable config per query, atomic reference swap for reloads |
 | `close()` error handling | Attempt all providers, collect failures, throw aggregate error | Partial close would leak connections — always try all, report all failures |
@@ -1738,19 +1761,22 @@ import type { QueryDefinition, MetadataConfig, ExecutionContext } from '@mkven/m
 const configErrors = validateConfig(metadata)       // returns ConfigError | null
 
 // At query time — validate query before sending
-const queryErrors = validateQuery(definition, context, metadata, roles)  // returns ValidationError | null
+const index = new MetadataIndex(metadata, roles)    // pre-index once
+const queryErrors = validateQuery(definition, context, index, roles)  // returns ValidationError | null
 ```
 
 Both `validateConfig()` and `validateQuery()` return `null` on success, or the corresponding error object (not thrown) so the caller can decide how to handle it. The core package still throws these errors internally.
 
-`validateQuery()` builds lightweight internal indexes (table-by-apiName, column-by-apiName maps) on each call. For hot paths, callers can pre-index metadata once and pass the indexed form — the function accepts both raw `MetadataConfig` and a pre-indexed `MetadataIndex` (exported from the package) to avoid repeated indexing.
+`validateQuery()` always requires a pre-indexed `MetadataIndex` (exported from the package). Callers pre-index metadata once via `new MetadataIndex(config, roles)` and reuse it across calls — no hidden per-call indexing.
 
 ```ts
 // Pre-indexed metadata for hot-path validation
 interface MetadataIndex {
   tablesByApiName: Map<string, TableMeta>
-  columnsByTable: Map<string, Map<string, ColumnMeta>>  // tableApiName → columnApiName → ColumnMeta
-  rolesByName: Map<string, RoleMeta>
+  tablesById: Map<string, TableMeta>       // tableId → TableMeta
+  columnsByTable: Map<string, Map<string, ColumnMeta>>  // tableId → columnApiName → ColumnMeta
+  databasesById: Map<string, DatabaseMeta> // databaseId → DatabaseMeta
+  rolesById: Map<string, RoleMeta>
 }
 ```
 
@@ -1951,8 +1977,6 @@ This ensures both implementations behave identically — same results, same erro
 │   │       └── debug/
 │   │           └── logger.ts        # DebugLogger — collects entries per query
 │   │   └── tests/
-│   │       ├── fixtures/
-│   │       │   └── testConfig.ts     # shared test config (reuses validation fixtures + adds executors)
 │   │       ├── init/                # scenarios 53, 54, 55, 63
 │   │       ├── access/              # scenarios 13, 14, 14b–14f, 16, 38, 95, 104, 106, 233
 │   │       ├── planner/             # scenarios 1–12, 19, 33, 56, 57, 59, 64, 79, 103, 130
@@ -1970,8 +1994,6 @@ This ensures both implementations behave identically — same results, same erro
 │   │       └── contract/
 │   │           └── queryContract.ts  # describeQueryContract — parameterized contract test suite
 │   │   └── tests/
-│   │       ├── fixtures/
-│   │       │   └── testConfig.ts     # shared test config for client tests
 │   │       ├── client/              # scenarios 208–218, 226
 │   │       └── contract/            # scenarios 219–225
 │   │
